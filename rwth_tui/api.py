@@ -6,6 +6,7 @@ Absichtlich nur GET (plus Token-Erneuerung): Das Programm meldet nie etwas an
 oder ab, auch wenn das Token es dürfte.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ REST = f"{SITE}/ee/rest"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "rwth-tui"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "rwth-tui"
 SESSION_FILE = CONFIG_DIR / "session.json"
+CTX = "design=ca;lang=de"
 
 
 class RwthError(Exception):
@@ -53,6 +55,7 @@ class Rwth:
         self.http.headers.update({"User-Agent": "rwth-tui", "Accept": "application/json"})
         self._use(session or load_session() or self._relogin("nosession"))
         (CACHE_DIR / "json").mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / "json").chmod(0o700)  # enthält Noten
 
     def _use(self, session):
         self.data = session
@@ -90,19 +93,44 @@ class Rwth:
 
     def get(self, path, **params):
         """GET auf einen REST-Pfad; bei Netzfehlern gibt es die letzte Antwort aus dem Cache."""
-        cache = CACHE_DIR / "json" / (path.strip("/").replace("/", "_") + ".json")
+        name = path.strip("/").replace("/", "_")
+        if params:
+            name += "_" + hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
+        cache = CACHE_DIR / "json" / (name + ".json")
         try:
             r = self._get(path, params)
             if r.status_code == 401:
                 self._refresh()
                 r = self._get(path, params)
         except (requests.ConnectionError, requests.Timeout):
-            if cache.exists() and not params:
+            if cache.exists():
                 return json.loads(cache.read_text())
             raise RwthError("Keine Verbindung zu RWTHonline.", "offline")
         if r.status_code >= 400:
             raise RwthError(f"RWTHonline antwortet {r.status_code} auf {path}", str(r.status_code))
         result = r.json()
-        if not params:
-            cache.write_text(json.dumps(result))
+        cache.write_text(json.dumps(result))
         return result
+
+    # Die Abfragen der Web-App nachgebaut (Filter/Sortierung aus dem Frontend-Code ee/ui/ca2).
+    # Ohne vollständigen Filter antwortet myCourses mit 500.
+
+    def studies(self):
+        return [r["content"]["CmStudyInfoDto"] for r in self.get("slc.cm.cs/student/myStudies/chooser")["resource"]]
+
+    def current_term(self):
+        return self.get("slc.lib.sm/currentTerm")["resource"][0]["content"]["semesterLibDto"]
+
+    def semesters(self):
+        return self.get("slc.lib.tm/semesters/student")["semesters"]
+
+    def achievements(self):
+        return [r["content"]["achievementDto"] for r in self.get("slc.xm.ac/achievements")["resource"]]
+
+    def registrations(self, term_id):
+        return self.get("slc.tm.cp/student/myCourses", **{
+            "$ctx": CTX, "$filter": f"termId-eq={term_id};filterTerm-like=;courseGroupRegistrationStatusIds-in=",
+            "$orderBy": "title=ascnf", "$skip": "0", "$top": "200"})["registrations"]
+
+    def registered_exams(self):
+        return self.get("slc.xm.exr/registered-exams", **{"$ctx": CTX})["examOffers"]

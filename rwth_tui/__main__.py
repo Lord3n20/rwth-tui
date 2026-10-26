@@ -18,7 +18,10 @@ def main():
     if args[:1] == ["code"]:
         from .credentials import code
         return code(args[1:])
-    print("Aufruf: rwth [login [--show] | logout | dump [PFAD …] | secret [user|password|totp] | code]  (Ansicht folgt)")
+    if not args:
+        from .app import main as app
+        return app()
+    print("Aufruf: rwth [login [--show] | logout | dump [PFAD …] | secret [user|password|totp] | code]  (ohne Argument: Ansicht)")
     return 2
 
 
