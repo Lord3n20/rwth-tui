@@ -35,7 +35,11 @@ def fake_get(self, path, **params):
     return json.loads(f.read_text())
 
 
-api.Rwth.__init__ = lambda self, session=None: None
+def fake_init(self, session=None, offline=False):
+    self.offline, self.lock = offline, None
+
+
+api.Rwth.__init__ = fake_init
 api.Rwth.get = fake_get
 
 

@@ -2,6 +2,7 @@
 
 import json
 import re
+from itertools import combinations
 
 from .api import CONFIG_DIR
 
@@ -49,6 +50,13 @@ class Module:
         self.max_attempts = None
         self.done_term = None    # Semester der (letzten) bestandenen Leistung, falls zuordenbar
         self.courses = {}        # {Semesterschlüssel: [LV-Anmeldungen]} (Vorlesungen, Seminare … dem Modul zugeordnet)
+
+    @property
+    def words(self):
+        """Wörter aus Modul-, Teilprüfungs- und LV-Namen für den Abgleich (einmal berechnet)."""
+        if not hasattr(self, "_words"):
+            self._words = words(self.name + " " + " ".join(element_names(self.raw)))
+        return self._words
 
     @property
     def recommended(self):
@@ -151,21 +159,39 @@ class PlanStore:
         PLAN_FILE.write_text(json.dumps(self.data, indent=1))
 
 
+def exact_choice(modules, need, limit=14):
+    """Die eine Auswahl, deren restliche ECTS genau need ergeben – None, wenn es keine oder mehrere gibt
+    (bei mehr als limit Kandidaten wird nicht gesucht)."""
+    if len(modules) > limit:
+        return None
+    found = None
+    for n in range(1, len(modules) + 1):
+        for combo in combinations(modules, n):
+            if sum(m.remaining for m in combo) == need:
+                if found is not None:
+                    return None
+                found = combo
+    return list(found) if found else None
+
+
 def suggest(modules, areas, explicit, start, current):
     """Ungeplante Module ins empfohlene Semester des Uni-Plans legen (liegt es zurück: nächstes gleicher
-    Art, WiSe bzw. SoSe). Bereiche mit Auswahl (mehr Module als ECTS nötig) bleiben dem Nutzer überlassen."""
-    choice = set()
+    Art, WiSe bzw. SoSe). In Bereichen mit Auswahl nur, wenn genau eine Kombination die fehlenden ECTS
+    füllt (Ergänzung: noch 8 ECTS, nur das Praktikum hat 8); sonst bleibt die Wahl dem Nutzer."""
+    open_ = [m for m in modules if not m.done and not m.planned and m.code not in explicit]
+    chosen = set(open_)
     for area in areas:
         info = area.get("progressInfo") or {}
         if not info.get("totalCredits"):
             continue
         name = val(area["name"])
-        mine = [m for m in modules if m.area == name and not m.done]
-        need = info["totalCredits"] - (info.get("achievedCredits") or 0) - sum(m.remaining for m in mine if m.planned)
-        if sum(m.remaining for m in mine if not m.planned) > need:
-            choice.add(name)
-    for m in modules:
-        if m.done or m.planned or m.code in explicit or not m.rec_terms or m.area in choice:
+        need = info["totalCredits"] - (info.get("achievedCredits") or 0) - sum(
+            m.remaining for m in modules if m.area == name and not m.done and m.planned)
+        candidates = [m for m in open_ if m.area == name]
+        if sum(m.remaining for m in candidates) > need:
+            chosen -= set(candidates) - set(exact_choice(candidates, need) or [] if need > 0 else [])
+    for m in open_:
+        if m not in chosen or not m.rec_terms:
             continue
         key = add_terms(start, m.rec_terms[0] - 1)
         while key < current:
@@ -199,7 +225,7 @@ class Matcher:
     „Soziologie“ stehen in vielen Modulen)."""
 
     def __init__(self, modules):
-        self.names = {m: words(m.name + " " + " ".join(element_names(m.raw))) for m in modules}
+        self.names = {m: m.words for m in modules}
         self.df = {}
         for ws in self.names.values():
             for w in ws:

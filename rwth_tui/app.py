@@ -13,8 +13,8 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, OptionList, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 
-from .api import SITE, NotLoggedIn, Rwth, RwthError
-from .plan import (Matcher, PlanStore, add_terms, build_modules, match_achievements, match_failed,
+from .api import SITE, NotLoggedIn, Rwth, RwthError, parallel
+from .plan import (Matcher, Module, PlanStore, add_terms, build_modules, match_achievements, match_failed,
                    match_registration, next_key, prev_key, sort_modules, suggest)
 
 ALL = "alle"
@@ -212,29 +212,37 @@ class RwthApp(App):
 
     @work(thread=True, exclusive=True, group="load")
     def load_all(self):
+        """Erst sofort die zuletzt gespeicherten Antworten zeigen, dann alles frisch aus RWTHonline."""
+        if self.api is None:
+            try:
+                self.api = Rwth(offline=True)
+                self.load_from(self.api)
+            except RwthError:
+                pass  # erster Start: noch nichts gespeichert
         try:
-            if self.api is None:
-                self.api = Rwth()
-            studies = self.api.studies()
-            achievements = self.api.achievements()
-            current = self.api.current_term()
-            semesters = self.api.semesters()
-            self.call_from_thread(self.show_overview, studies, achievements, current, semesters)
-            progress = {s["studyId"]: self.api.study_progress(s) for s in studies if s.get("myStudyLink")}
-            self.call_from_thread(self.show_progress, progress)
-            exams = self.api.registered_exams()
-            self.call_from_thread(self.show_exams, exams)
-            self.fetch_plan(self.study())
+            self.api = Rwth()
+            self.reg_cache.clear()
+            self.load_from(self.api)
         except RwthError as e:
             self.call_from_thread(self.fail, e)
+
+    def load_from(self, api):
+        studies, achievements, current, semesters = parallel(api.studies, api.achievements, api.current_term,
+                                                             api.semesters)
+        self.call_from_thread(self.show_overview, studies, achievements, current, semesters)
+        linked = [s for s in studies if s.get("myStudyLink")]
+        exams, *progress = parallel(api.registered_exams, *[lambda s=s: api.study_progress(s) for s in linked])
+        self.call_from_thread(self.show_progress, {s["studyId"]: p for s, p in zip(linked, progress)})
+        self.call_from_thread(self.show_exams, exams)
+        self.fetch_plan(self.study(), refresh=True)
 
     @work(thread=True, exclusive=True, group="plan")
     def load_plan(self, study):
         self.fetch_plan(study)
 
-    def fetch_plan(self, study):
+    def fetch_plan(self, study, refresh=False):
         """Studienplan einer Studienrichtung laden (läuft im Worker-Thread, ~2 MB beim ersten Mal)."""
-        if not study or not study.get("myStudyLink") or study["studyId"] in self.modules:
+        if not study or not study.get("myStudyLink") or (study["studyId"] in self.modules and not refresh):
             return
         try:
             open_modules, semester_plan, areas = self.api.curriculum(study)
@@ -260,12 +268,14 @@ class RwthApp(App):
         negative = [a for a in self.all_achievements
                     if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id
                     and a.get("achievementStatusType") == "FINAL" and (a.get("gradeDto") or {}).get("isNegative")]
-        for m, a in match_failed(modules, negative, achievement_title).items():
+        def attempts(m, a):
             try:
                 result = self.api.achievement(a["id"])["attemptCountResult"]
                 m.attempts, m.max_attempts = result["attemptCount"], result["parameters"]["maxAttempts"]
             except (RwthError, KeyError, TypeError):
                 m.attempts = 1
+
+        parallel(*[lambda m=m, a=a: attempts(m, a) for m, a in match_failed(modules, negative, achievement_title).items()])
 
     def assign_done_terms(self, modules, study_id):
         """Bestandenen Modulen das Semester ihrer letzten bestandenen Leistung geben (für den Rückblick im Plan).
@@ -294,19 +304,23 @@ class RwthApp(App):
     def assign_courses(self, modules, study_id):
         """LV-Anmeldungen vom Studienbeginn bis zum aktuellen Semester laden (Worker-Thread) und zuordnen."""
         start = self.start_of(study_id)
-        terms = self.course_terms[study_id] = []
-        for term in self.all_semesters:
-            if not start <= term["key"] <= self.current["key"]:
-                continue
+        wanted = [t for t in self.all_semesters if start <= t["key"] <= self.current["key"]]
+
+        def fetch(term):
             try:
-                regs = self.reg_cache.get(term["id"])
-                if regs is None:
-                    regs = self.reg_cache[term["id"]] = self.api.registrations(term["id"])
+                if term["id"] not in self.reg_cache:
+                    self.reg_cache[term["id"]] = self.api.registrations(term["id"])
+                return self.reg_cache[term["id"]]
             except RwthError:
-                continue
-            # nur Anmeldungen für diesen Studiengang (jede nennt ihn in studyProgramme)
-            terms.append((term["key"], [r for r in regs
-                                        if str((r.get("studyProgramme") or {}).get("id")) == str(study_id)]))
+                return None
+
+        terms = self.course_terms[study_id] = []
+        for term, regs in zip(wanted, parallel(*[lambda t=t: fetch(t) for t in wanted])):
+            if regs is not None:
+                # nur Anmeldungen für diesen Studiengang (jede nennt ihn in studyProgramme)
+                terms.append((term["key"], [r for r in regs
+                                            if str((r.get("studyProgramme") or {}).get("id")) == str(study_id)]))
+        terms.sort()
         self.place_courses(study_id, modules)
 
     def place_courses(self, study_id, modules):
@@ -619,7 +633,8 @@ class RwthApp(App):
                 if not choice:
                     continue
                 if sum(m.remaining for m in choice) > need:  # Auswahl: nur ein Teil davon nötig
-                    table.add_row("", "", "", f"{INDENT}[i]{escape(area_short(area))}: noch {need} ECTS wählen[/]")
+                    text = f"noch {need} ECTS wählen" if need else "reicht schon – die hier sind nicht nötig"
+                    table.add_row("", "", "", f"{INDENT}[i]{escape(area_short(area))}: {text}[/]")
                     self.plan_rows.append(("info", None))
                 for m in choice:
                     add_module(m)
@@ -627,9 +642,11 @@ class RwthApp(App):
                 if m.area not in {a for a, _ in self.area_needs(modules)}:
                     add_module(m)
 
-        rows = [r[1] for r in self.plan_rows]
-        if keep is not None and keep in rows:
-            table.move_cursor(row=rows.index(keep))
+        # Module per Nummer vergleichen: nach dem Nachladen aus RWTHonline sind es neue Objekte
+        ident = lambda obj: obj.code if isinstance(obj, Module) else obj
+        rows = [ident(r[1]) for r in self.plan_rows]
+        if keep is not None and ident(keep) in rows:
+            table.move_cursor(row=rows.index(ident(keep)))
         elif self.current["key"] in rows:  # Start: aktuelles Semester, abgeschlossene darüber
             table.move_cursor(row=rows.index(self.current["key"]))
         self.refresh_detail()
@@ -644,10 +661,12 @@ class RwthApp(App):
         shown += [m for m in modules if m.courses.get(key) and m not in shown]
         for m in shown:
             add_module(m, key=key)
+        full = {area for area, need in self.area_needs(modules) if need == 0}  # Bereich reicht schon
         for m in modules:
             if key in self.uni_keys(m) and m not in shown:
-                add_module(m, key=key, note="" if m.done else
-                           "fehlt" + (f" → {term_label(m.planned)}" if m.planned else ""))
+                note = ("" if m.done else f"fehlt → {term_label(m.planned)}" if m.planned else
+                        "nicht nötig" if m.area in full else "fehlt")
+                add_module(m, key=key, note=note)
 
     @staticmethod
     def module_style(m, key=None):

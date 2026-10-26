@@ -9,6 +9,8 @@ oder ab, auch wenn das Token es dürfte.
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -49,8 +51,22 @@ def delete_session():
     SESSION_FILE.unlink(missing_ok=True)
 
 
+def parallel(*calls):
+    """Mehrere Abfragen gleichzeitig (RWTHonline antwortet je Anfrage träge); Ergebnisse in Aufrufreihenfolge,
+    der erste Fehler wird weitergereicht."""
+    if len(calls) < 2:
+        return [c() for c in calls]
+    with ThreadPoolExecutor(max_workers=min(len(calls), 6)) as pool:
+        return [f.result() for f in [pool.submit(c) for c in calls]]
+
+
 class Rwth:
-    def __init__(self, session=None):
+    def __init__(self, session=None, offline=False):
+        """offline=True: nur die zuletzt gespeicherten Antworten (für den Sofortstart), keine Anmeldung."""
+        self.offline = offline
+        self.lock = threading.Lock()  # nur eine Token-Erneuerung zugleich
+        if offline:
+            return
         self.http = requests.Session()
         self.http.headers.update({"User-Agent": "rwth-tui", "Accept": "application/json"})
         self._use(session or load_session() or self._relogin("nosession"))
@@ -97,10 +113,17 @@ class Rwth:
         if params:
             name += "_" + hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
         cache = CACHE_DIR / "json" / (name + ".json")
+        if self.offline:
+            if not cache.exists():
+                raise RwthError(f"Noch nichts gespeichert für {path}", "nocache")
+            return json.loads(cache.read_text())
         try:
+            token = self.data["access_token"]
             r = self._get(path, params)
             if r.status_code == 401:
-                self._refresh()
+                with self.lock:  # parallele Abfragen: nur die erste erneuert, die anderen nehmen das neue Token
+                    if self.data["access_token"] == token:
+                        self._refresh()
                 r = self._get(path, params)
         except (requests.ConnectionError, requests.Timeout):
             if cache.exists():
@@ -144,8 +167,10 @@ class Rwth:
         """Module (offen/laufend/erledigt), empfohlener Studienverlauf und Bereiche aus „Mein Studium“."""
         root = study["myStudyLink"]["href"].split("/ee/rest/", 1)[1]
         base = f"slc.cm.cs/student/myStudies/{study['studyId']}"
-        areas = [r["content"]["myCurriculumElementDto"] for r in self.get(f"{root}/children")["resource"]]
-        return self.get(f"{base}/myCurriculumOpenModules"), self.get(f"{base}/myCurriculumSemesterPlan"), areas
+        children, open_modules, semester_plan = parallel(lambda: self.get(f"{root}/children"),
+                                                         lambda: self.get(f"{base}/myCurriculumOpenModules"),
+                                                         lambda: self.get(f"{base}/myCurriculumSemesterPlan"))
+        return open_modules, semester_plan, [r["content"]["myCurriculumElementDto"] for r in children["resource"]]
 
     def achievement(self, achievement_id):
         """Einzelne Leistung mit Versuchszählung (attemptCountResult: attemptCount, parameters.maxAttempts)."""

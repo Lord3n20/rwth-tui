@@ -7,8 +7,8 @@ Prüfungsanmeldungen und eine Studienplanung, ohne Browser.
 - **Anmeldungen**: LV-Anmeldungen des gewählten Semesters samt Abmeldefrist und zugehörigem Modul.
 - **Prüfungen**: angemeldete Prüfungen.
 - **Plan**: Module aus „Mein Studium“ auf Semester verteilen und mit dem Semesterplan der Uni
-  (30 ECTS je Semester) vergleichen. Ungeplante Module stehen als Vorschlag im empfohlenen Semester
-  (Wahlbereiche ausgenommen). Abgeschlossene Semester zeigen, was dort bestanden und belegt wurde
+  (30 ECTS je Semester) vergleichen. Ungeplante Module stehen als Vorschlag im empfohlenen Semester;
+  in Wahlbereichen nur, wenn genau eine Kombination die fehlenden ECTS füllt. Abgeschlossene Semester zeigen, was dort bestanden und belegt wurde
   und was aus dem Uni-Plan noch fehlt.
 
 Die Planung liegt nur lokal in `~/.config/rwth-tui/plan.json`. Gegenüber RWTHonline ist das Programm
@@ -49,7 +49,7 @@ Eine abgelaufene Sitzung meldet das Programm still neu an. `rwth logout` löscht
 
 ## Benutzung
 
-`rwth` startet die Ansicht. Links wählt man ein Semester (oder „Gesamt“), rechts die Reiter.
+`rwth` startet die Ansicht – sofort mit den zuletzt gespeicherten Daten, frische kommen parallel nach. Links wählt man ein Semester (oder „Gesamt“), rechts die Reiter.
 
 | Taste | |
 |---|---|
