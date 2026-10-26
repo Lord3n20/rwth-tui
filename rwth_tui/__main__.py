@@ -12,7 +12,13 @@ def main():
     if args[:1] == ["dump"]:
         from .dump import main as dump
         return dump(args[1:])
-    print("Aufruf: rwth [login | logout | dump [PFAD …]]  (Ansicht folgt)")
+    if args[:1] == ["secret"]:
+        from .secrets import setup
+        return setup(args[1:])
+    if args[:1] == ["code"]:
+        from .secrets import code
+        return code(args[1:])
+    print("Aufruf: rwth [login | logout | dump [PFAD …] | secret [user|password|totp] | code]  (Ansicht folgt)")
     return 2
 
 
