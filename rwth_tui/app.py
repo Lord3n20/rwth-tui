@@ -1,4 +1,4 @@
-"""Textual-Oberfläche: Semester links, rechts Leistungen (Noten/ECTS), LV-Anmeldungen und Prüfungen."""
+"""Textual-Oberfläche: Semester links, rechts Leistungen (Noten/ECTS), LV-Anmeldungen, Prüfungen und Studienplan."""
 
 import subprocess
 from datetime import datetime
@@ -7,13 +7,20 @@ from rich.markup import escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, TabbedContent, TabPane
 
 from .api import SITE, NotLoggedIn, Rwth, RwthError
+from .plan import PlanStore, add_terms, build_modules, next_key, prev_key, sort_modules
 
 ALL = "alle"
 STATUS = {"FIX": "Fixplatz", "BW": "beworben", "VOE": "vorgemerkt"}
+MODULE_STATUS = {"COMPLETED_SUCCESSFULLY": "abgeschlossen", "IN_PROGRESS": "läuft", "OPEN": "offen",
+                 "BOOKMARKED": "vorgemerkt"}
+AREA_SHORT = {"Pflichtbereich": "Pflicht", "Ergänzungsbereich": "Ergänzung", "Wahlpflichtbereich": "Wahlpflicht",
+              "Bachelorarbeit": "BA", "Masterarbeit": "MA"}
+PLAN_ACTIONS = {"plan_later", "plan_earlier", "plan_remove"}
 
 
 def val(obj):
@@ -82,12 +89,16 @@ class RwthApp(App):
     #study { padding: 0 1; height: auto; }
     #tabs { height: 1fr; }
     #detail-box { height: 40%; border-top: solid $primary-darken-2; }
+    #plan-sum { padding: 0 1; height: auto; }
     ListView { height: 1fr; }
     """
     BINDINGS = [
         Binding("r", "refresh", "Neu laden"),
         Binding("s", "next_study", "Studiengang"),
         Binding("o", "open_browser", "Im Browser"),
+        Binding("plus", "plan_later", "Später"),
+        Binding("minus", "plan_earlier", "Früher"),
+        Binding("x", "plan_remove", "Aus Plan"),
         Binding("tab", "focus_next", "Bereich wechseln", show=False),
         Binding("q", "quit", "Beenden"),
     ]
@@ -106,6 +117,9 @@ class RwthApp(App):
                         yield DataTable(id="registrations", cursor_type="row", zebra_stripes=True)
                     with TabPane("Prüfungen", id="tab-exams"):
                         yield DataTable(id="exams", cursor_type="row", zebra_stripes=True)
+                    with TabPane("Plan", id="tab-plan"):
+                        yield Label("", id="plan-sum")
+                        yield DataTable(id="plan", cursor_type="row", zebra_stripes=True)
                 with VerticalScroll(id="detail-box"):
                     yield Markdown(id="detail")
         yield Footer()
@@ -116,9 +130,13 @@ class RwthApp(App):
         self.all_achievements, self.terms, self.current = [], [], None
         self.shown_achievements, self.regs, self.exams = [], [], []
         self.reg_cache, self.progress = {}, {}
+        self.modules, self.areas, self.plan_errors = {}, {}, {}
+        self.shown_modules, self.plan_store = [], PlanStore()
+        self.detail_text, self.detail_timer = None, None
         self.query_one("#achievements", DataTable).add_columns("Semester", "Datum", "Note", "ECTS", "Leistung")
         self.query_one("#registrations", DataTable).add_columns("Art", "Status", "Abmelden bis", "Gruppe", "Lehrveranstaltung")
         self.query_one("#exams", DataTable).add_columns("Datum", "Prüfung", "Status")
+        self.query_one("#plan", DataTable).add_columns("", "Bereich", "ECTS", "Note", "Empf.", "Geplant", "Modul")
         self.query_one("#terms", ListView).focus()
         self.action_refresh()
 
@@ -131,6 +149,8 @@ class RwthApp(App):
 
     def action_refresh(self):
         self.reg_cache.clear()
+        self.modules.clear()
+        self.plan_errors.clear()
         self.load_all()
 
     @work(thread=True, exclusive=True, group="load")
@@ -147,8 +167,28 @@ class RwthApp(App):
             self.call_from_thread(self.show_progress, progress)
             exams = self.api.registered_exams()
             self.call_from_thread(self.show_exams, exams)
+            self.fetch_plan(self.study())
         except RwthError as e:
             self.call_from_thread(self.fail, e)
+
+    @work(thread=True, exclusive=True, group="plan")
+    def load_plan(self, study):
+        self.fetch_plan(study)
+
+    def fetch_plan(self, study):
+        """Studienplan einer Studienrichtung laden (läuft im Worker-Thread, ~2 MB beim ersten Mal)."""
+        if not study or not study.get("myStudyLink") or study["studyId"] in self.modules:
+            return
+        try:
+            open_modules, semester_plan, areas = self.api.curriculum(study)
+        except RwthError as e:
+            self.plan_errors[study["studyId"]] = str(e)
+            self.call_from_thread(self.show_plan)
+            return
+        modules = build_modules(open_modules, semester_plan)
+        self.plan_store.apply(study["studyId"], modules, self.current["key"])
+        self.modules[study["studyId"]], self.areas[study["studyId"]] = modules, areas
+        self.call_from_thread(self.fill_terms)
 
     @work(thread=True, exclusive=True, group="regs")
     def load_registrations(self, term):
@@ -179,27 +219,56 @@ class RwthApp(App):
         self.show_study()
 
     def show_study(self):
+        self.show_header()
+        self.fill_terms()
+
+    def study_start(self):
+        keys = [a["semesterLibDto"]["key"] for a in self.study_achievements()]
+        return min(keys + [self.current["key"]])
+
+    def study_modules(self):
+        study = self.study()
+        return self.modules.get(study["studyId"]) if study else None
+
+    def planned_ects(self, key):
+        return sum(m.remaining for m in self.study_modules() or [] if not m.done and m.planned == key)
+
+    def fill_terms(self):
+        """Semester vom ersten mit Leistungen bis zum nächsten nach dem aktuellen, dazu künftige
+        bis Ende der Regelstudienzeit bzw. bis zum letzten verplanten (die haben noch keine id)."""
         mine = self.study_achievements()
-        # Semester: vom ersten mit Leistungen bis zum nächsten nach dem aktuellen.
-        keys = {a["semesterLibDto"]["key"] for a in mine} | {self.current["key"]}
-        first = min(keys)
+        first = self.study_start()
         upper = max(s["key"] for s in self.all_semesters if s["key"] <= self.current["key"] or
                     s["id"] == self.current["id"] + 1) if self.all_semesters else self.current["key"]
-        self.terms = sorted((s for s in self.all_semesters if first <= s["key"] <= upper),
-                            key=lambda s: s["key"], reverse=True) or [self.current]
-        ects, _ = summary(mine)
-        self.show_header()
+        terms = [s for s in self.all_semesters if first <= s["key"] <= upper] or [self.current]
+        modules = self.study_modules() or []
+        last = max([add_terms(first, max((m.recommended or 1) for m in modules) - 1)] if modules else [upper])
+        last = max([last] + [m.planned for m in modules if m.planned and not m.done])
+        key = next_key(upper)
+        while key <= last:
+            terms.append({"key": key, "id": None})
+            key = next_key(key)
+        terms.sort(key=lambda s: s["key"], reverse=True)
 
         lv = self.query_one("#terms", ListView)
-        index = lv.index
+        old = (self.selected_term() or {}).get("key") if self.terms else None
+        self.terms = terms
+        ects, _ = summary(mine)
         lv.clear()
         lv.append(ListItem(Label(f"[b]{'Gesamt':<12}{ects:>3} ECTS[/]")))
         for t in self.terms:
             e, _ = summary([a for a in mine if a["semesterLibDto"]["key"] == t["key"]])
+            planned = self.planned_ects(t["key"])
             mark = " [b yellow]●[/]" if t["id"] == self.current["id"] else ""
-            lv.append(ListItem(Label(f"{term_label(t['key']):<12}{e:>3} ECTS{mark}" if e else
-                                     f"{term_label(t['key']):<12}   –{mark}")))
-        lv.index = min(index or 0, len(self.terms))  # Start: Gesamt (Anmeldungen dann vom aktuellen Semester)
+            if e:
+                right = f"{e:>3} ECTS"
+            elif planned:
+                right = f"[cyan]+{planned:>2} gepl.[/]"
+            else:
+                right = "   –"
+            lv.append(ListItem(Label(f"{term_label(t['key']):<12}{right}{mark}")))
+        # Start: Gesamt (Anmeldungen dann vom aktuellen Semester); sonst gewähltes Semester behalten
+        lv.index = next((i + 1 for i, t in enumerate(self.terms) if t["key"] == old), 0)
         self.show_term()
 
     def show_progress(self, progress):
@@ -225,7 +294,7 @@ class RwthApp(App):
 
     def selected_term(self):
         index = self.query_one("#terms", ListView).index or 0
-        return None if index == 0 else self.terms[index - 1]
+        return None if index == 0 or index > len(self.terms) else self.terms[index - 1]
 
     def show_term(self):
         term = self.selected_term()
@@ -236,7 +305,11 @@ class RwthApp(App):
         target = term or self.current
         self.query_one("#tabs", TabbedContent).get_tab("tab-registrations").label = \
             f"Anmeldungen {term_label(target['key'])}"
-        self.load_registrations(target)
+        if target["id"] is None:  # künftiges Semester, gibt es in RWTHonline noch nicht
+            self.show_registrations(target, [])
+        else:
+            self.load_registrations(target)
+        self.show_plan()
 
     def show_achievements(self, achievements):
         self.shown_achievements = achievements
@@ -254,7 +327,7 @@ class RwthApp(App):
         self.refresh_detail()
 
     def show_registrations(self, term, regs):
-        if term["id"] != (self.selected_term() or self.current)["id"]:
+        if term["key"] != (self.selected_term() or self.current)["key"]:
             return
         self.regs = regs
         table = self.query_one("#registrations", DataTable)
@@ -285,6 +358,57 @@ class RwthApp(App):
         tab.label = f"Prüfungen ({len(exams)})" if exams else "Prüfungen"
         self.refresh_detail()
 
+    def show_plan(self, keep=None):
+        """Module der Studienrichtung (bei gewähltem Semester nur die dort verplanten); keep = Cursor-Modul."""
+        table = self.query_one("#plan", DataTable)
+        total_label = self.query_one("#plan-sum", Label)
+        keep = keep or self.selected_module()
+        table.clear()
+        study, modules = self.study(), self.study_modules()
+        if modules is None:
+            self.shown_modules = []
+            error = self.plan_errors.get(study["studyId"]) if study else None
+            total_label.update(f"[red]{escape(error)}[/]" if error else
+                               "Lade Studienplan …" if study and study.get("myStudyLink") else
+                               "Für diese Studienrichtung gibt es keinen Studienplan.")
+            self.refresh_detail()
+            return
+        term = self.selected_term()
+        shown = sort_modules(modules)
+        if term:
+            shown = [m for m in shown if m.planned == term["key"] and not m.done]
+        self.shown_modules = shown
+        start = self.study_start()
+        for m in shown:
+            mark = {"COMPLETED_SUCCESSFULLY": "[green]✓[/]", "IN_PROGRESS": "[yellow]▶[/]"}.get(m.status, "[dim]○[/]")
+            ects = f"{m.achieved}/{m.total}" if m.achieved and not m.done else str(m.total)
+            planned = term_label(m.planned) if m.planned and not m.done else ""
+            if planned and m.recommended and m.planned > add_terms(start, m.recommended - 1):
+                planned = f"[yellow]{planned}[/]"  # später als im Studienverlaufsplan
+            table.add_row(mark, AREA_SHORT.get(m.area, m.area[:11]), ects, m.grade,
+                          f"{m.recommended}." if m.recommended else "", planned, escape(m.name))
+        if keep in shown:
+            table.move_cursor(row=shown.index(keep))
+        self.show_plan_sum(modules)
+        self.refresh_detail()
+
+    def show_plan_sum(self, modules):
+        """Je Bereich: erreicht + verplant / gefordert (grün, wenn der Plan reicht)."""
+        parts, done_sum, plan_sum, total_sum = [], 0, 0, 0
+        for area in self.areas.get(self.study()["studyId"], []):
+            info = area.get("progressInfo") or {}
+            if not info.get("totalCredits"):
+                continue
+            name = val(area["name"])
+            achieved, total = info.get("achievedCredits") or 0, info["totalCredits"]
+            planned = sum(m.remaining for m in modules if m.area == name and m.planned and not m.done)
+            color = "green" if achieved + planned >= total else "default"
+            text = f"{AREA_SHORT.get(name, name)} [{color}]{achieved}" + (f"[cyan]+{planned}[/]" if planned else "")
+            parts.append(text + f"/{total}[/]")
+            done_sum, plan_sum, total_sum = done_sum + achieved, plan_sum + planned, total_sum + total
+        parts.append(f"[b]Σ {done_sum}" + (f"[cyan]+{plan_sum}[/]" if plan_sum else "") + f"/{total_sum}[/]")
+        self.query_one("#plan-sum", Label).update(" · ".join(parts))
+
     # ------------------------------------------------------------------ Detail
 
     def active_table(self):
@@ -292,17 +416,29 @@ class RwthApp(App):
 
     def refresh_detail(self):
         table = self.active_table()
-        md = self.query_one("#detail", Markdown)
         row = table.cursor_row if table.row_count else None
         if table.id == "achievements":
             if row is None:
-                md.update("_Keine Leistungen in diesem Semester._")
+                self.set_detail("_Keine Leistungen in diesem Semester._")
             else:
-                md.update(self.achievement_md(self.shown_achievements[row]))
+                self.set_detail(self.achievement_md(self.shown_achievements[row]))
         elif table.id == "registrations":
-            md.update(self.registration_md(self.regs[row]) if row is not None else "_Keine Anmeldungen._")
+            self.set_detail(self.registration_md(self.regs[row]) if row is not None else "_Keine Anmeldungen._")
+        elif table.id == "plan":
+            self.set_detail(self.module_md(self.shown_modules[row]) if row is not None else
+                      "_Nichts für dieses Semester geplant._ Unter „Gesamt“ Module mit +/- einplanen.")
         else:
-            md.update(f"```\n{self.exams[row]}\n```" if row is not None else "_Keine Prüfungsanmeldungen._")
+            self.set_detail(f"```\n{self.exams[row]}\n```" if row is not None else "_Keine Prüfungsanmeldungen._")
+
+    def set_detail(self, text):
+        """Erst kurz nach der letzten Änderung zeichnen: überlappende Markdown-Updates
+        (schnelles Scrollen, +/-) brechen sich sonst gegenseitig ab und hinterlassen Reste."""
+        if text == self.detail_text:
+            return
+        self.detail_text = text
+        if self.detail_timer:
+            self.detail_timer.stop()
+        self.detail_timer = self.set_timer(0.08, lambda: self.query_one("#detail", Markdown).update(self.detail_text))
 
     def achievement_md(self, a):
         c = a.get("cpCourseLibDto") or {}
@@ -340,6 +476,82 @@ class RwthApp(App):
                  "", "_o: im Browser (dort ab- oder ummelden)_"]
         return "\n".join(lines)
 
+    def module_md(self, m):
+        lines = [f"## {m.name}", "", f"**{m.code}** · {escape(' › '.join(m.paths[0]))}"]
+        lines += [f"- auch: {' › '.join(p)}" for p in m.paths[1:]]
+        lines += ["", f"- Status: **{MODULE_STATUS.get(m.status, m.status)}**",
+                  f"- ECTS: **{m.achieved}/{m.total}**" + (f" · Note **{m.grade}**" if m.grade else "")]
+        if m.recommended:
+            lines.append(f"- Empfohlen: {m.recommended}. Fachsemester "
+                         f"({term_label(add_terms(self.study_start(), m.recommended - 1))})")
+        if not m.done:
+            lines.append(f"- Geplant: {term_label(m.planned) if m.planned else '–'}")
+
+        def parts(children, depth):
+            for c in children:
+                info = c.get("progressInfo") or {}
+                name = val(c.get("name"))
+                if c.get("elementType") == "EXAM":
+                    ok = "✓" if info.get("success") else "○"
+                    grade = info.get("grade") if info.get("grade") not in (None, "-") else ""
+                    yield (f"{'  ' * depth}- {ok} {name} – {info.get('achievedCredits') or 0}/"
+                           f"{info.get('totalCredits') or 0} ECTS" + (f", Note **{grade}**" if grade else ""))
+                elif name:
+                    yield f"{'  ' * depth}- _LV: {name}_"
+                yield from parts(c.get("children") or [], depth + 1)
+
+        children = list(parts(m.raw.get("children") or [], 0))
+        if children:
+            lines += ["", "### Bestandteile", *children]
+        if not m.done:
+            lines += ["", "_+/-: Semester verschieben · x: aus dem Plan nehmen_"]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ Planen
+
+    def check_action(self, action, parameters):
+        if action in PLAN_ACTIONS:
+            try:
+                return self.query_one("#tabs", TabbedContent).active == "tab-plan"
+            except NoMatches:
+                return False
+        return True
+
+    def selected_module(self):
+        table = self.query_one("#plan", DataTable)
+        return self.shown_modules[table.cursor_row] if table.row_count else None
+
+    def plan_module(self, m, key):
+        self.plan_store.set(self.study()["studyId"], m, key)
+        self.fill_terms()
+        self.show_plan(keep=m)
+        self.notify(f"{m.name} → {term_label(key) if key else 'nicht geplant'}", timeout=3)
+
+    def shift(self, step):
+        m = self.selected_module()
+        if not m:
+            return
+        if m.done:
+            self.notify("Schon abgeschlossen.", severity="warning", timeout=3)
+            return
+        now = self.current["key"]
+        if m.planned is None:  # erst mal ins empfohlene Semester, frühestens das aktuelle
+            key = add_terms(self.study_start(), m.recommended - 1) if m.recommended else next_key(now)
+        else:
+            key = step(m.planned)
+        self.plan_module(m, max(key, now))
+
+    def action_plan_later(self):
+        self.shift(next_key)
+
+    def action_plan_earlier(self):
+        self.shift(prev_key)
+
+    def action_plan_remove(self):
+        m = self.selected_module()
+        if m and not m.done and m.planned:
+            self.plan_module(m, None)
+
     # ------------------------------------------------------------------ Ereignisse
 
     def on_list_view_highlighted(self, event: ListView.Highlighted):
@@ -351,12 +563,14 @@ class RwthApp(App):
             self.refresh_detail()
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
+        self.refresh_bindings()
         self.refresh_detail()
 
     def action_next_study(self):
         if len(self.studies) > 1:
             self.study_index = (self.study_index + 1) % len(self.studies)
             self.show_study()
+            self.load_plan(self.study())
 
     def action_open_browser(self):
         table = self.active_table()

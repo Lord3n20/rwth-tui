@@ -139,3 +139,10 @@ class Rwth:
 
     def registered_exams(self):
         return self.get("slc.xm.exr/registered-exams", **{"$ctx": CTX})["examOffers"]
+
+    def curriculum(self, study):
+        """Module (offen/laufend/erledigt), empfohlener Studienverlauf und Bereiche aus „Mein Studium“."""
+        root = study["myStudyLink"]["href"].split("/ee/rest/", 1)[1]
+        base = f"slc.cm.cs/student/myStudies/{study['studyId']}"
+        areas = [r["content"]["myCurriculumElementDto"] for r in self.get(f"{root}/children")["resource"]]
+        return self.get(f"{base}/myCurriculumOpenModules"), self.get(f"{base}/myCurriculumSemesterPlan"), areas

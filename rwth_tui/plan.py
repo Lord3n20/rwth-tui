@@ -83,8 +83,8 @@ def build_modules(open_modules, semester_plan):
 
 
 def sort_modules(modules):
-    return sorted(modules, key=lambda m: (STATUS_ORDER.get(m.status, 1), m.planned or "99", m.recommended or 99,
-                                          m.area, m.name))
+    """Feste Reihenfolge (nicht nach geplantem Semester), damit +/- die Zeilen nicht umsortiert."""
+    return sorted(modules, key=lambda m: (STATUS_ORDER.get(m.status, 1), m.recommended or 99, m.area, m.name))
 
 
 class PlanStore:
