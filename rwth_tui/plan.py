@@ -41,8 +41,12 @@ class Module:
         self.achieved = info.get("achievedCredits") or 0
         self.total = info.get("totalCredits") or 0
         self.grade = info.get("grade") if info.get("grade") not in (None, "-") else ""
-        self.recommended = None  # Fachsemester laut Studienverlaufsplan
+        self.rec_terms = []      # Fachsemester laut Semesterplan der Uni (manche Module über zwei)
         self.planned = None      # Semesterschlüssel, z. B. '27S'
+
+    @property
+    def recommended(self):
+        return self.rec_terms[0] if self.rec_terms else None
 
     @property
     def remaining(self):
@@ -77,8 +81,8 @@ def build_modules(open_modules, semester_plan):
             continue
         for raw in group["list"]:
             m = modules.get(raw.get("designation"))
-            if m and (m.recommended is None or int(ref.rstrip(".")) < m.recommended):
-                m.recommended = int(ref.rstrip("."))
+            if m and _valid(raw) and int(ref.rstrip(".")) not in m.rec_terms:
+                m.rec_terms = sorted(m.rec_terms + [int(ref.rstrip("."))])
     return list(modules.values())
 
 
