@@ -11,7 +11,8 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-CREDENTIALS = Path.home() / ".config/rwth-tui/credentials.json"
+# wie api.CONFIG_DIR (nicht importiert: login_window.py lädt dieses Modul ohne Paket)
+CREDENTIALS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "rwth-tui" / "credentials.json"
 
 KEYS = {"user": "Benutzername (ab123456)", "password": "RWTH-Passwort", "totp": "TOTP-Geheimnis (Base32 oder otpauth://-Link)",
         "token": "Beschreibung des TOTP-Tokens im IdM-Selfservice (leer = „tui“)"}

@@ -4,11 +4,12 @@ Inoffizielle Terminal-Oberfläche (Textual) für RWTHonline: Leistungen und Note
 Prüfungsanmeldungen und eine Studienplanung, ohne Browser.
 
 - **Leistungen**: Noten, ECTS, Schnitt; nicht bestanden rot, ungültig durchgestrichen.
-- **Anmeldungen**: LV-Anmeldungen des gewählten Semesters samt Abmeldefrist.
+- **Anmeldungen**: LV-Anmeldungen des gewählten Semesters samt Abmeldefrist und zugehörigem Modul.
 - **Prüfungen**: angemeldete Prüfungen.
 - **Plan**: Module aus „Mein Studium“ auf Semester verteilen und mit dem Semesterplan der Uni
-  (30 ECTS je Semester) vergleichen. Abgeschlossene Semester zeigen, was dort bestanden und belegt
-  wurde und was aus dem Uni-Plan noch fehlt.
+  (30 ECTS je Semester) vergleichen. Ungeplante Module stehen als Vorschlag im empfohlenen Semester
+  (Wahlbereiche ausgenommen). Abgeschlossene Semester zeigen, was dort bestanden und belegt wurde
+  und was aus dem Uni-Plan noch fehlt.
 
 Die Planung liegt nur lokal in `~/.config/rwth-tui/plan.json`. Gegenüber RWTHonline ist das Programm
 rein lesend (nur GET, plus Token-Erneuerung).
@@ -58,11 +59,18 @@ Eine abgelaufene Sitzung meldet das Programm still neu an. `rwth logout` löscht
 | `x` | Modul aus dem Plan nehmen |
 | `u` | Vorschläge aus dem Semesterplan der Uni einblenden |
 | `e` | Erledigte Module einblenden |
+| `z` | LV-Anmeldung von Hand einem Modul zuordnen (Reiter Anmeldungen) |
 | `r` | Neu laden |
 
 Farben im Plan: grün bestanden, lila belegt (LV-Anmeldung), blau läuft, orange/rot nach 1/≥2
-Fehlversuchen, grau ungeplant. RWTHonline verknüpft LV-Anmeldungen und Leistungen nicht mit Modulen;
-die Zuordnung geschieht über die Namen und kann danebenliegen.
+Fehlversuchen, grau ungeplant.
+
+RWTHonline verknüpft LV-Anmeldungen und Leistungen nicht direkt mit Modulen. Anmeldungen werden über
+ihr Anmeldeverfahren zugeordnet (heißt oft wie das Modul), Leistungen über die angemeldete LV, sonst
+über Namen und ECTS. Liegt eine Zuordnung daneben, korrigiert `z` sie (gespeichert in `plan.json`, ✎).
+
+`python tests/fake_run.py ORDNER` spielt die Ansicht offline mit den zwischengespeicherten Antworten
+aus `~/.cache/rwth-tui/json` durch (Screenshots + Plan als Text).
 
 `rwth dump [PFAD …]` speichert Rohantworten der REST-API nach `~/.cache/rwth-tui/dump/`, um weitere
 Endpunkte zu erkunden.

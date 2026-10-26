@@ -132,10 +132,21 @@ class PlanStore:
     def explicit(self, study_id):
         return set(self.data.get(str(study_id), {}))
 
+    def course_overrides(self, study_id):
+        """{LV-id: Modulnummer} – von Hand zugeordnete LV-Anmeldungen, "" = keinem Modul."""
+        return self.data.get("_courses", {}).get(str(study_id), {})
+
+    def set_course(self, study_id, course_id, code):
+        self.data.setdefault("_courses", {}).setdefault(str(study_id), {})[str(course_id)] = code
+        self._save()
+
     def set(self, study_id, module, key):
         module.planned, module.suggested = key, False
         # None auch merken: sonst gälte wieder das aktuelle Semester (Laufendes) bzw. der Uni-Vorschlag
         self.data.setdefault(str(study_id), {})[module.code] = key
+        self._save()
+
+    def _save(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         PLAN_FILE.write_text(json.dumps(self.data, indent=1))
 
@@ -182,23 +193,65 @@ def element_names(raw):
         yield from element_names(c)
 
 
+class Matcher:
+    """Ordnet Leistungen bzw. LV-Anmeldungen Modulen zu. RWTHonline verknüpft das nicht, also nach
+    Wortüberschneidung mit Modul-, Teilprüfungs- und LV-Namen; seltene Wörter zählen mehr (Fachnamen wie
+    „Soziologie“ stehen in vielen Modulen)."""
+
+    def __init__(self, modules):
+        self.names = {m: words(m.name + " " + " ".join(element_names(m.raw))) for m in modules}
+        self.df = {}
+        for ws in self.names.values():
+            for w in ws:
+                self.df[w] = self.df.get(w, 0) + 1
+
+    def score(self, m, title):
+        mine = words(title)
+        return sum(1 / self.df[w] for w in self.names[m] & mine)
+
+    def ranked(self, title):
+        """Module nach Passung, beste zuerst (für die Auswahl von Hand)."""
+        return sorted(self.names, key=lambda m: -self.score(m, title))
+
+    def best(self, title, among=None):
+        """Bestes Modul (aus among, sonst allen) mit mindestens einem gemeinsamen Wort, sonst None."""
+        best = max(among or self.names, key=lambda m: self.score(m, title), default=None)
+        return best if best and self.score(best, title) else None
+
+    def by_name(self, name):
+        """Modul mit genau diesem Namen (Anmeldeverfahren heißen oft wie das Modul)."""
+        key = normalize(name)
+        return next((m for m in self.names if normalize(m.name) == key), None)
+
+
+def normalize(name):
+    return re.sub(r"[\W_]+", " ", name.lower()).strip()
+
+
+def module_credits(m):
+    """ECTS, die eine Leistung zu diesem Modul haben kann: das ganze Modul oder eine Teilprüfung."""
+    return {m.total} | {(e.get("progressInfo") or {}).get("totalCredits") for e in m.exams()}
+
+
 def match_achievements(modules, achievements, title):
-    """{Modul: [Leistungen]}. RWTHonline verknüpft beides nicht, also nach Wortüberschneidung mit Modul-,
-    Teilprüfungs- und LV-Namen; seltene Wörter zählen mehr (Fachnamen wie „Soziologie“ stehen in vielen
-    Modulen). Jede Leistung bzw. Anmeldung nur beim am besten passenden Modul."""
-    names = {m: words(m.name + " " + " ".join(element_names(m.raw))) for m in modules}
-    df = {}
-    for ws in names.values():
-        for w in ws:
-            df[w] = df.get(w, 0) + 1
-    result = {}
+    """{Modul: [Leistungen]}; jede Leistung nur beim am besten passenden Modul. Passen die ECTS der Leistung
+    zu einem Modul oder seiner Teilprüfung, kommen nur solche in Frage („Seminar Theologie“ mit 10 ECTS
+    gehört dann zu „Wissenschaft, Technik und Gesellschaft“, nicht zu „Einführung in die Theologie“ mit 8)."""
+    matcher, result = Matcher(modules), {}
     for a in achievements:
-        mine = words(title(a))
-        score = lambda m: sum(1 / df[w] for w in names[m] & mine)
-        best = max(names, key=score, default=None)
-        if best and score(best):
+        credits = a.get("credits")
+        among = [m for m in modules if credits and credits in module_credits(m)]
+        best = matcher.best(title(a), among) or (None if among else matcher.best(title(a)))
+        if best:
             result.setdefault(best, []).append(a)
     return result
+
+
+def match_registration(matcher, r, title):
+    """Modul zu einer LV-Anmeldung: Name des Anmeldeverfahrens = Modulname, sonst Abgleich über Verfahrens-
+    und LV-Namen zusammen („Vorlesung Neuzeit: …“ allein passte zum falschen Modul)."""
+    procedure = val(r.get("registrationProcedureName"))
+    return matcher.by_name(procedure) or matcher.best(procedure + " " + title(r))
 
 
 def match_failed(modules, achievements, title):

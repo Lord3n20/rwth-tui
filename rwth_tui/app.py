@@ -9,10 +9,13 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.css.query import NoMatches
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, TabbedContent, TabPane
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, OptionList, TabbedContent, TabPane
+from textual.widgets.option_list import Option
 
 from .api import SITE, NotLoggedIn, Rwth, RwthError
-from .plan import PlanStore, add_terms, build_modules, match_achievements, suggest, match_failed, next_key, prev_key, sort_modules
+from .plan import (Matcher, PlanStore, add_terms, build_modules, match_achievements, match_failed,
+                   match_registration, next_key, prev_key, sort_modules, suggest)
 
 ALL = "alle"
 STATUS = {"FIX": "Fixplatz", "BW": "beworben", "VOE": "vorgemerkt"}
@@ -82,6 +85,14 @@ def numeric_grade(a):
         return None
 
 
+def achievement_title(a):
+    return val((a.get("cpCourseLibDto") or {}).get("courseTitle")) or val(a.get("subject"))
+
+
+def course_title(r):
+    return val(r["course"]["courseTitle"])
+
+
 def summary(achievements):
     """ECTS-Summe und ECTS-gewichteter Schnitt der benoteten, bestandenen Leistungen."""
     passed = [a for a in achievements if counts(a)]
@@ -90,6 +101,36 @@ def summary(achievements):
     weight = sum(c for _, c in graded)
     avg = sum(g * c for g, c in graded) / weight if weight else None
     return ects, avg
+
+
+class ModulePicker(ModalScreen):
+    """Auswahl des Moduls für eine LV-Anmeldung. Ergebnis: Modulnummer, "" = keinem Modul, None = abgebrochen."""
+    CSS = """
+    ModulePicker { align: center middle; }
+    #picker { width: 90%; max-width: 110; height: 80%; border: thick $primary; background: $surface; }
+    #picker-title { padding: 0 1; text-style: bold; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Abbrechen")]
+
+    def __init__(self, title, modules):
+        super().__init__()
+        self.title_text, self.modules = title, modules
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Label(f"Modul für: {escape(self.title_text)}", id="picker-title")
+            yield OptionList(Option("[dim]– keinem Modul –[/]", id="-"),
+                             *[Option(f"{escape(m.name)}  [dim]{m.total} ECTS · {escape(m.area)}[/]", id=m.code)
+                               for m in self.modules])
+
+    def on_mount(self):
+        self.query_one(OptionList).highlighted = 1 if self.modules else 0
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        self.dismiss("" if event.option.id == "-" else event.option.id)
+
+    def action_cancel(self):
+        self.dismiss(None)
 
 
 class RwthApp(App):
@@ -112,6 +153,7 @@ class RwthApp(App):
         Binding("x", "plan_remove", "Aus Plan"),
         Binding("u", "toggle_uni", "Uni-Vorschläge"),
         Binding("e", "toggle_done", "Erledigte"),
+        Binding("z", "assign_course", "Modul zuordnen"),
         Binding("tab", "focus_next", "Bereich wechseln", show=False),
         Binding("q", "quit", "Beenden"),
     ]
@@ -143,12 +185,13 @@ class RwthApp(App):
         self.all_achievements, self.terms, self.current = [], [], None
         self.shown_achievements, self.regs, self.exams = [], [], []
         self.reg_cache, self.progress, self.loose_courses = {}, {}, {}
+        self.course_terms, self.course_module = {}, {}  # je Studiengang: [(Semester, Anmeldungen)], {LV-id: Modul}
         self.modules, self.areas, self.plan_errors = {}, {}, {}
         self.plan_rows, self.plan_store = [], PlanStore()
         self.show_uni, self.show_done = False, False
         self.detail_text, self.detail_timer = None, None
         self.query_one("#achievements", DataTable).add_columns("Semester", "Datum", "Note", "ECTS", "Leistung")
-        self.query_one("#registrations", DataTable).add_columns("Art", "Status", "Abmelden bis", "Gruppe", "Lehrveranstaltung")
+        self.query_one("#registrations", DataTable).add_columns("Art", "Status", "Abmelden bis", "Modul", "Lehrveranstaltung", "Gruppe")
         self.query_one("#exams", DataTable).add_columns("Datum", "Prüfung", "Status")
         self.query_one("#plan", DataTable).add_columns("", "ECTS", "Uni", "Modul")
         self.query_one("#terms", ListView).focus()
@@ -201,8 +244,11 @@ class RwthApp(App):
             return
         modules = build_modules(open_modules, semester_plan)
         self.count_attempts(modules, study["studyId"])
-        self.assign_done_terms(modules, study["studyId"])
+        # Reihenfolge: Anmeldungen zuordnen, dann Leistungen (nutzen dieselbe LV, wo es eine gibt), dann
+        # Anmeldungen noch einmal, weil früher Bestandenes für spätere Anmeldungen nicht mehr in Frage kommt
         self.assign_courses(modules, study["studyId"])
+        self.assign_done_terms(modules, study["studyId"])
+        self.place_courses(study["studyId"], modules)
         self.plan_store.apply(study["studyId"], modules, self.current["key"])
         suggest(modules, areas, self.plan_store.explicit(study["studyId"]), self.start_of(study["studyId"]),
                 self.current["key"])
@@ -214,8 +260,7 @@ class RwthApp(App):
         negative = [a for a in self.all_achievements
                     if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id
                     and a.get("achievementStatusType") == "FINAL" and (a.get("gradeDto") or {}).get("isNegative")]
-        title = lambda a: val((a.get("cpCourseLibDto") or {}).get("courseTitle")) or val(a.get("subject"))
-        for m, a in match_failed(modules, negative, title).items():
+        for m, a in match_failed(modules, negative, achievement_title).items():
             try:
                 result = self.api.achievement(a["id"])["attemptCountResult"]
                 m.attempts, m.max_attempts = result["attemptCount"], result["parameters"]["maxAttempts"]
@@ -223,12 +268,22 @@ class RwthApp(App):
                 m.attempts = 1
 
     def assign_done_terms(self, modules, study_id):
-        """Bestandenen Modulen das Semester ihrer passenden bestandenen Leistung geben (für den Rückblick im Plan)."""
+        """Bestandenen Modulen das Semester ihrer letzten bestandenen Leistung geben (für den Rückblick im Plan).
+        Gehört die Leistung zu einer angemeldeten LV, gilt deren Modul, sonst der Namens- und ECTS-Abgleich."""
         passed = [a for a in self.all_achievements
                   if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id and counts(a)]
-        title = lambda a: val((a.get("cpCourseLibDto") or {}).get("courseTitle")) or val(a.get("subject"))
-        for m, found in match_achievements([m for m in modules if m.done], passed, title).items():
-            m.done_term = max(a["semesterLibDto"]["key"] for a in found)
+        by_course = self.course_module.get(study_id, {})
+        found, rest = {}, []
+        for a in passed:
+            m = by_course.get(str((a.get("cpCourseLibDto") or {}).get("id")))
+            if m and m.done:
+                found.setdefault(m, []).append(a)
+            else:
+                rest.append(a)
+        for m, more in match_achievements([m for m in modules if m.done], rest, achievement_title).items():
+            found.setdefault(m, []).extend(more)
+        for m, achievements in found.items():
+            m.done_term = max(a["semesterLibDto"]["key"] for a in achievements)
 
     def start_of(self, study_id):
         """Erstes Semester mit Leistungen in diesem Studiengang (sonst das aktuelle)."""
@@ -237,12 +292,9 @@ class RwthApp(App):
         return min(keys + [self.current["key"]])
 
     def assign_courses(self, modules, study_id):
-        """LV-Anmeldungen vom Studienbeginn bis zum aktuellen Semester laden und den Modulen zuordnen
-        (Worker-Thread). RWTHonline sagt nicht, zu welchem Studiengang eine Anmeldung gehört; was zu keinem
-        Modul passt, landet in self.loose_courses und erscheint nur im Detail der Semester-Überschrift."""
+        """LV-Anmeldungen vom Studienbeginn bis zum aktuellen Semester laden (Worker-Thread) und zuordnen."""
         start = self.start_of(study_id)
-        loose = self.loose_courses[study_id] = {}
-        title = lambda r: val(r["course"]["courseTitle"])
+        terms = self.course_terms[study_id] = []
         for term in self.all_semesters:
             if not start <= term["key"] <= self.current["key"]:
                 continue
@@ -252,13 +304,32 @@ class RwthApp(App):
                     regs = self.reg_cache[term["id"]] = self.api.registrations(term["id"])
             except RwthError:
                 continue
+            # nur Anmeldungen für diesen Studiengang (jede nennt ihn in studyProgramme)
+            terms.append((term["key"], [r for r in regs
+                                        if str((r.get("studyProgramme") or {}).get("id")) == str(study_id)]))
+        self.place_courses(study_id, modules)
+
+    def place_courses(self, study_id, modules):
+        """LV-Anmeldungen den Modulen zuordnen: von Hand Zugeordnetes (Taste z) gilt, sonst das Anmeldeverfahren
+        (plan.match_registration). Was zu keinem Modul passt, landet in self.loose_courses und erscheint nur im
+        Detail der Semester-Überschrift."""
+        fixed = self.plan_store.course_overrides(study_id)
+        by_code = {m.code: m for m in modules}
+        placed = self.course_module[study_id] = {}
+        loose = self.loose_courses[study_id] = {}
+        for m in modules:
+            m.courses = {}
+        for key, regs in self.course_terms.get(study_id, []):
             # schon in einem früheren Semester bestandene Module kommen nicht mehr in Frage
-            candidates = [m for m in modules if not (m.done and m.done_term and m.done_term < term["key"])]
-            found = match_achievements(candidates, regs, title)
-            for m, rs in found.items():
-                m.courses[term["key"]] = rs
-            matched = {id(r) for rs in found.values() for r in rs}
-            loose[term["key"]] = [r for r in regs if id(r) not in matched]
+            matcher = Matcher([m for m in modules if not (m.done and m.done_term and m.done_term < key)])
+            for r in regs:
+                cid = str(r["course"]["id"])
+                m = by_code.get(fixed[cid]) if cid in fixed else match_registration(matcher, r, course_title)
+                placed[cid] = m
+                if m:
+                    m.courses.setdefault(key, []).append(r)
+                else:
+                    loose.setdefault(key, []).append(r)
 
     @work(thread=True, exclusive=True, group="regs")
     def load_registrations(self, term):
@@ -415,7 +486,7 @@ class RwthApp(App):
                 grade = f"[dim strike]{grade}[/]"
             elif not counts(a):
                 grade = f"[b red]{grade}[/]"
-            title = val((a.get("cpCourseLibDto") or {}).get("courseTitle")) or val(a.get("subject"))
+            title = achievement_title(a)
             table.add_row(term_label(a["semesterLibDto"]["key"]), fmt_dt(a.get("achievementDate"), time=False),
                           grade, str(a.get("credits") or ""), escape(title))
         self.refresh_detail()
@@ -436,9 +507,20 @@ class RwthApp(App):
                 dereg_text = f"[b yellow]{dereg_text}[/]"
             elif dereg:
                 dereg_text = f"[dim]{dereg_text}[/]"
-            table.add_row(c["courseTypeDto"]["key"], STATUS.get(status, status), dereg_text,
-                          escape(r.get("courseGroupName") or ""), escape(val(c["courseTitle"])))
+            table.add_row(c["courseTypeDto"]["key"], STATUS.get(status, status), dereg_text, self.module_cell(r),
+                          escape(val(c["courseTitle"])), escape(r.get("courseGroupName") or ""))
         self.refresh_detail()
+
+    def module_cell(self, r):
+        """Zugeordnetes Modul einer LV-Anmeldung; ✎ = von Hand (Taste z)."""
+        study = self.study()
+        if not study or study["studyId"] not in self.course_module:
+            return ""
+        cid = str(r["course"]["id"])
+        m = self.course_module[study["studyId"]].get(cid)
+        hand = " ✎" if cid in self.plan_store.course_overrides(study["studyId"]) else ""
+        name = "" if not m else m.name if len(m.name) <= 30 else m.name[:29] + "…"
+        return (f"[{BOOKED}]{escape(name)}[/]" if m else "[dim]–[/]") + hand
 
     def show_exams(self, exams):
         self.exams = exams
@@ -489,7 +571,7 @@ class RwthApp(App):
                 name += f"  [{BOOKED}]({'/'.join(types)})[/]"
             if key and m.done and m.done_term != key:
                 note = f"(bestanden {term_label(m.done_term)})" if m.done_term else "(bestanden)"
-            if m.suggested and not uni_only and m.planned == key:
+            if m.suggested and not uni_only and m.planned == key and not m.courses.get(key):
                 note = (note + " " if note else "") + "(Vorschlag)"
             if note:
                 name += f"  [dim]{note}[/]"
@@ -756,9 +838,10 @@ class RwthApp(App):
     # ------------------------------------------------------------------ Planen
 
     def check_action(self, action, parameters):
-        if action in PLAN_ACTIONS:
+        tab = {**{a: "tab-plan" for a in PLAN_ACTIONS}, "assign_course": "tab-registrations"}.get(action)
+        if tab:
             try:
-                return self.query_one("#tabs", TabbedContent).active == "tab-plan"
+                return self.query_one("#tabs", TabbedContent).active == tab
             except NoMatches:
                 return False
         return True
@@ -803,6 +886,28 @@ class RwthApp(App):
     def action_toggle_done(self):
         self.show_done = not self.show_done
         self.show_plan()
+
+    def action_assign_course(self):
+        """LV-Anmeldung unter dem Cursor von Hand einem Modul zuordnen (passendste zuerst)."""
+        study, modules = self.study(), self.study_modules()
+        table = self.query_one("#registrations", DataTable)
+        if not study or not modules or not self.regs or table.cursor_row >= len(self.regs):
+            self.notify("Studienplan noch nicht geladen.", severity="warning", timeout=3)
+            return
+        r = self.regs[table.cursor_row]
+        cid = str(r["course"]["id"])
+        choices = Matcher(modules).ranked(course_title(r))
+
+        def chosen(code):
+            if code is None:
+                return
+            self.plan_store.set_course(study["studyId"], cid, code)
+            self.place_courses(study["studyId"], modules)
+            self.show_registrations(self.selected_term() or self.current, self.regs)
+            self.fill_terms()
+            self.show_plan()
+
+        self.push_screen(ModulePicker(course_title(r), choices), chosen)
 
     def action_plan_remove(self):
         m = self.selected_module()
