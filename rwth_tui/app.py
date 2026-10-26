@@ -12,7 +12,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, TabbedContent, TabPane
 
 from .api import SITE, NotLoggedIn, Rwth, RwthError
-from .plan import PlanStore, add_terms, build_modules, match_achievements, match_failed, next_key, prev_key, sort_modules
+from .plan import PlanStore, add_terms, build_modules, match_achievements, suggest, match_failed, next_key, prev_key, sort_modules
 
 ALL = "alle"
 STATUS = {"FIX": "Fixplatz", "BW": "beworben", "VOE": "vorgemerkt"}
@@ -204,6 +204,8 @@ class RwthApp(App):
         self.assign_done_terms(modules, study["studyId"])
         self.assign_courses(modules, study["studyId"])
         self.plan_store.apply(study["studyId"], modules, self.current["key"])
+        suggest(modules, areas, self.plan_store.explicit(study["studyId"]), self.start_of(study["studyId"]),
+                self.current["key"])
         self.modules[study["studyId"]], self.areas[study["studyId"]] = modules, areas
         self.call_from_thread(self.fill_terms)
 
@@ -228,13 +230,17 @@ class RwthApp(App):
         for m, found in match_achievements([m for m in modules if m.done], passed, title).items():
             m.done_term = max(a["semesterLibDto"]["key"] for a in found)
 
+    def start_of(self, study_id):
+        """Erstes Semester mit Leistungen in diesem Studiengang (sonst das aktuelle)."""
+        keys = [a["semesterLibDto"]["key"] for a in self.all_achievements
+                if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id]
+        return min(keys + [self.current["key"]])
+
     def assign_courses(self, modules, study_id):
         """LV-Anmeldungen vom Studienbeginn bis zum aktuellen Semester laden und den Modulen zuordnen
         (Worker-Thread). RWTHonline sagt nicht, zu welchem Studiengang eine Anmeldung gehört; was zu keinem
         Modul passt, landet in self.loose_courses und erscheint nur im Detail der Semester-Überschrift."""
-        keys = [a["semesterLibDto"]["key"] for a in self.all_achievements
-                if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id]
-        start = min(keys + [self.current["key"]])
+        start = self.start_of(study_id)
         loose = self.loose_courses[study_id] = {}
         title = lambda r: val(r["course"]["courseTitle"])
         for term in self.all_semesters:
@@ -483,6 +489,8 @@ class RwthApp(App):
                 name += f"  [{BOOKED}]({'/'.join(types)})[/]"
             if key and m.done and m.done_term != key:
                 note = f"(bestanden {term_label(m.done_term)})" if m.done_term else "(bestanden)"
+            if m.suggested and not uni_only and m.planned == key:
+                note = (note + " " if note else "") + "(Vorschlag)"
             if note:
                 name += f"  [dim]{note}[/]"
             if uni_only:

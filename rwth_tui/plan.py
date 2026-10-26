@@ -44,6 +44,7 @@ class Module:
         self.grade = info.get("grade") if info.get("grade") not in (None, "-") else ""
         self.rec_terms = []      # Fachsemester laut Semesterplan der Uni (manche Module über zwei)
         self.planned = None      # Semesterschlüssel, z. B. '27S'
+        self.suggested = False   # planned stammt aus dem Uni-Plan, nicht von Hand
         self.attempts = 0        # Fehlversuche (aus der zugeordneten Leistung), 0 = unbekannt/keine
         self.max_attempts = None
         self.done_term = None    # Semester der (letzten) bestandenen Leistung, falls zuordenbar
@@ -128,15 +129,37 @@ class PlanStore:
             elif m.status == "IN_PROGRESS":
                 m.planned = current_key  # Laufendes zählt erst mal fürs aktuelle Semester
 
+    def explicit(self, study_id):
+        return set(self.data.get(str(study_id), {}))
+
     def set(self, study_id, module, key):
-        module.planned = key
-        mine = self.data.setdefault(str(study_id), {})
-        if key is None and module.status != "IN_PROGRESS":
-            mine.pop(module.code, None)
-        else:
-            mine[module.code] = key  # bei Laufendem auch None merken, sonst gilt wieder das aktuelle Semester
+        module.planned, module.suggested = key, False
+        # None auch merken: sonst gälte wieder das aktuelle Semester (Laufendes) bzw. der Uni-Vorschlag
+        self.data.setdefault(str(study_id), {})[module.code] = key
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         PLAN_FILE.write_text(json.dumps(self.data, indent=1))
+
+
+def suggest(modules, areas, explicit, start, current):
+    """Ungeplante Module ins empfohlene Semester des Uni-Plans legen (liegt es zurück: nächstes gleicher
+    Art, WiSe bzw. SoSe). Bereiche mit Auswahl (mehr Module als ECTS nötig) bleiben dem Nutzer überlassen."""
+    choice = set()
+    for area in areas:
+        info = area.get("progressInfo") or {}
+        if not info.get("totalCredits"):
+            continue
+        name = val(area["name"])
+        mine = [m for m in modules if m.area == name and not m.done]
+        need = info["totalCredits"] - (info.get("achievedCredits") or 0) - sum(m.remaining for m in mine if m.planned)
+        if sum(m.remaining for m in mine if not m.planned) > need:
+            choice.add(name)
+    for m in modules:
+        if m.done or m.planned or m.code in explicit or not m.rec_terms or m.area in choice:
+            continue
+        key = add_terms(start, m.rec_terms[0] - 1)
+        while key < current:
+            key = add_terms(key, 2)
+        m.planned, m.suggested = key, True
 
 
 GENERIC_WORDS = {"klausur", "prüfung", "modul", "modulprüfung", "vorlesung", "hausarbeit", "einführung",
