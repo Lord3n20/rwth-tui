@@ -1,6 +1,7 @@
 """Studienplanung: Module aus „Mein Studium“ (RWTHonline) + eigene Semesterzuordnung (nur lokal gespeichert)."""
 
 import json
+import re
 
 from .api import CONFIG_DIR
 
@@ -43,6 +44,8 @@ class Module:
         self.grade = info.get("grade") if info.get("grade") not in (None, "-") else ""
         self.rec_terms = []      # Fachsemester laut Semesterplan der Uni (manche Module über zwei)
         self.planned = None      # Semesterschlüssel, z. B. '27S'
+        self.attempts = 0        # Fehlversuche (aus der zugeordneten Leistung), 0 = unbekannt/keine
+        self.max_attempts = None
 
     @property
     def recommended(self):
@@ -55,6 +58,21 @@ class Module:
     @property
     def done(self):
         return self.status == "COMPLETED_SUCCESSFULLY"
+
+    def exams(self):
+        def walk(children):
+            for c in children:
+                if c.get("elementType") == "EXAM":
+                    yield c
+                yield from walk(c.get("children") or [])
+        return list(walk(self.raw.get("children") or []))
+
+    @property
+    def failed(self):
+        """Bisher nicht bestanden: eine Teilprüfung hat eine Note, ist aber nicht erfolgreich (z. B. 5,0)."""
+        return not self.done and any(
+            (e.get("progressInfo") or {}).get("grade") not in (None, "-")
+            and not (e.get("progressInfo") or {}).get("success") for e in self.exams())
 
 
 def _valid(raw):
@@ -117,3 +135,23 @@ class PlanStore:
             mine[module.code] = key  # bei Laufendem auch None merken, sonst gilt wieder das aktuelle Semester
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         PLAN_FILE.write_text(json.dumps(self.data, indent=1))
+
+
+GENERIC_WORDS = {"klausur", "prüfung", "modul", "modulprüfung", "vorlesung", "hausarbeit", "einführung",
+                 "mündliche", "übung", "seminar", "oder", "inhalten", "teilprüfung", "modulteilprüfung"}
+
+
+def words(text):
+    return {w for w in re.findall(r"\w{4,}", text.lower())} - GENERIC_WORDS
+
+
+def match_failed(modules, achievements, title):
+    """{Modul: nicht bestandene Leistung}. RWTHonline verknüpft beides nicht, also nach Wortüberschneidung
+    mit Modul- und Teilprüfungsnamen der nicht bestandenen Module; jede Leistung nur beim am besten passenden."""
+    names = {m: words(m.name + " " + " ".join(val(e.get("name")) for e in m.exams())) for m in modules if m.failed}
+    result = {}
+    for a in achievements:
+        best = max(names, key=lambda m: len(names[m] & words(title(a))), default=None)
+        if best and names[best] & words(title(a)):
+            result.setdefault(best, a)
+    return result

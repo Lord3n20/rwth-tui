@@ -146,3 +146,7 @@ class Rwth:
         base = f"slc.cm.cs/student/myStudies/{study['studyId']}"
         areas = [r["content"]["myCurriculumElementDto"] for r in self.get(f"{root}/children")["resource"]]
         return self.get(f"{base}/myCurriculumOpenModules"), self.get(f"{base}/myCurriculumSemesterPlan"), areas
+
+    def achievement(self, achievement_id):
+        """Einzelne Leistung mit Versuchszählung (attemptCountResult: attemptCount, parameters.maxAttempts)."""
+        return self.get(f"slc.xm.ac/achievements/{achievement_id}")["resource"][0]["content"]["achievementExamDto"]
