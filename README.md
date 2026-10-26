@@ -62,7 +62,8 @@ Eine abgelaufene Sitzung meldet das Programm still neu an. `rwth logout` löscht
 | `z` | LV-Anmeldung von Hand einem Modul zuordnen (Reiter Anmeldungen) |
 | `r` | Neu laden |
 
-Farben im Plan: grün bestanden, lila belegt (LV-Anmeldung), blau läuft, orange/rot nach 1/≥2
+Farben im Plan: grün bestanden, türkis ◐ teils fertig (z. B. 2 von 4 Seminaren schon besucht), lila belegt
+(LV-Anmeldung), blau läuft, orange/rot nach 1/≥2
 Fehlversuchen, grau ungeplant.
 
 RWTHonline verknüpft LV-Anmeldungen und Leistungen nicht direkt mit Modulen. Anmeldungen werden über

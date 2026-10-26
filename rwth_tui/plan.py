@@ -59,6 +59,19 @@ class Module:
         return self._words
 
     @property
+    def parts(self):
+        """Wie viele LVs das Modul verlangt, aus dem Angebot („4 Vorlesungen/Seminare“), sonst None."""
+        for c in self.raw.get("children") or []:
+            found = c.get("elementType") == "OFFER" and re.match(r"(\d+)\s", val(c.get("name")) or "")
+            if found:
+                return int(found.group(1))
+        return None
+
+    def earlier_courses(self, key):
+        """LV-Anmeldungen aus Semestern vor key (dort schon besucht, auch wenn die Note noch fehlt)."""
+        return sum(len(regs) for k, regs in self.courses.items() if k < key)
+
+    @property
     def recommended(self):
         return self.rec_terms[0] if self.rec_terms else None
 

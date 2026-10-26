@@ -27,6 +27,7 @@ PLAN_ACTIONS = {"plan_later", "plan_earlier", "plan_remove", "toggle_uni", "togg
 AREA_PREFIXES = ("Wahlpflicht", "Pflicht", "Ergänzung", "Wahl", "Zusatz")
 ECTS_PER_TERM = 30  # Empfehlung der Uni: 30 ECTS je Semester
 BOOKED = "#d787ff"  # lila: Vorlesung/Seminar im Semester belegt
+PARTLY = "#5fd7af"  # türkis: schon ein Teil besucht/erreicht (z. B. 2 von 4 Seminaren), Rest läuft oder fehlt
 INDENT = "    "  # Module stehen eingerückt unter ihrer Semester-Überschrift
 
 
@@ -583,6 +584,10 @@ class RwthApp(App):
             if key and m.courses.get(key) and not (m.done and m.done_term == key):
                 types = sorted({r["course"]["courseTypeDto"]["key"] for r in m.courses[key]})
                 name += f"  [{BOOKED}]({'/'.join(types)})[/]"
+            begun = 0 if m.done else m.earlier_courses(key or self.current["key"])
+            if begun:
+                note = " · ".join(filter(None, [f"{begun} von {m.parts} schon besucht" if m.parts else
+                                              f"{begun} LV schon besucht", note]))
             if key and m.done and m.done_term != key:
                 note = f"(bestanden {term_label(m.done_term)})" if m.done_term else "(bestanden)"
             if m.suggested and not uni_only and m.planned == key and not m.courses.get(key):
@@ -668,14 +673,16 @@ class RwthApp(App):
                         "nicht nötig" if m.area in full else "fehlt")
                 add_module(m, key=key, note=note)
 
-    @staticmethod
-    def module_style(m, key=None):
-        """Symbol und Farbe: grün bestanden, orange/rot 1/≥2 Fehlversuche, lila in Semester key belegt
-        (LV-Anmeldung), blau läuft (Teilleistung/Prüfung), geplant normal, sonst grau."""
+    def module_style(self, m, key=None):
+        """Symbol und Farbe: grün bestanden, orange/rot 1/≥2 Fehlversuche, türkis teils fertig (LVs aus
+        früheren Semestern oder ECTS erreicht), lila in Semester key belegt (LV-Anmeldung), blau läuft
+        (Teilleistung/Prüfung), geplant normal, sonst grau."""
         if m.done:
             return "✓", "green"
         if m.failed:  # orange nach einem Fehlversuch, rot ab dem zweiten
             return "✗", "red" if m.attempts >= 2 else "#ff8c00"
+        if m.achieved or m.earlier_courses(key or self.current["key"]):
+            return "◐", PARTLY
         if key and m.courses.get(key):
             return "◆", BOOKED
         if m.status == "IN_PROGRESS" or m.achieved:
