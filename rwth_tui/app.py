@@ -24,6 +24,7 @@ PLAN_ACTIONS = {"plan_later", "plan_earlier", "plan_remove", "toggle_uni", "togg
 AREA_PREFIXES = ("Wahlpflicht", "Pflicht", "Ergänzung", "Wahl", "Zusatz")
 ECTS_PER_TERM = 30  # Empfehlung der Uni: 30 ECTS je Semester
 BOOKED = "#d787ff"  # lila: Vorlesung/Seminar im Semester belegt
+INDENT = "    "  # Module stehen eingerückt unter ihrer Semester-Überschrift
 
 
 def val(obj):
@@ -486,10 +487,13 @@ class RwthApp(App):
                 name += f"  [dim]{note}[/]"
             if uni_only:
                 name = f"[dim]{escape(m.name)}  (Uni)[/]"
-            table.add_row(f"[{color}]{mark}[/]", ects, uni_text, name)
+            table.add_row(f"[{color}]{mark}[/]", ects, uni_text, INDENT + name)  # eingerückt unter die Überschrift
             self.plan_rows.append(("module", m))
 
         def heading(text, right="", row=("info", None)):
+            if table.row_count:  # Leerzeile trennt die Abschnitte
+                table.add_row("", "", "", "")
+                self.plan_rows.append(("info", None))
             table.add_row("", right, "", f"[b]── {text} ──[/]")
             self.plan_rows.append(row)
 
@@ -525,7 +529,7 @@ class RwthApp(App):
                 if not choice:
                     continue
                 if sum(m.remaining for m in choice) > need:  # Auswahl: nur ein Teil davon nötig
-                    table.add_row("", "", "", f"[i]{escape(area_short(area))}: noch {need} ECTS wählen[/]")
+                    table.add_row("", "", "", f"{INDENT}[i]{escape(area_short(area))}: noch {need} ECTS wählen[/]")
                     self.plan_rows.append(("info", None))
                 for m in choice:
                     add_module(m)
@@ -543,7 +547,8 @@ class RwthApp(App):
     def add_past_term(self, key, modules, heading, add_module):
         """Abgeschlossenes Semester: dort Bestandenes, dort Belegtes, dann der Uni-Plan fürs Fachsemester."""
         e, _ = summary([a for a in self.study_achievements() if a["semesterLibDto"]["key"] == key])
-        heading(f"[green]{self.fachsemester(key)}. {term_label(key)} ✓[/]", f"[green]{e}[/][dim]/{ECTS_PER_TERM}[/]",
+        heading(f"{self.fachsemester(key)}. {term_label(key)}  [green]✓ abgeschlossen[/]",
+                f"[green]{e}[/][dim]/{ECTS_PER_TERM}[/]",
                 ("term", key))
         shown = [m for m in modules if m.done and m.done_term == key]
         shown += [m for m in modules if m.courses.get(key) and m not in shown]
