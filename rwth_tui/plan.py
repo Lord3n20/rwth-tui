@@ -46,6 +46,8 @@ class Module:
         self.planned = None      # Semesterschlüssel, z. B. '27S'
         self.attempts = 0        # Fehlversuche (aus der zugeordneten Leistung), 0 = unbekannt/keine
         self.max_attempts = None
+        self.done_term = None    # Semester der (letzten) bestandenen Leistung, falls zuordenbar
+        self.courses = {}        # {Semesterschlüssel: [LV-Anmeldungen]} (Vorlesungen, Seminare … dem Modul zugeordnet)
 
     @property
     def recommended(self):
@@ -141,17 +143,41 @@ GENERIC_WORDS = {"klausur", "prüfung", "modul", "modulprüfung", "vorlesung", "
                  "mündliche", "übung", "seminar", "oder", "inhalten", "teilprüfung", "modulteilprüfung"}
 
 
+ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
+
+
 def words(text):
-    return {w for w in re.findall(r"\w{4,}", text.lower())} - GENERIC_WORDS
+    """Bedeutungstragende Wörter plus Teilnummern („Höhere Mathematik 2“, „Physik II“ → #2)."""
+    numbers = {f"#{ROMAN.get(n, n)}" for n in re.findall(r"\b([1-9]|I{1,3}|IV|V)\b", text)}
+    return ({w for w in re.findall(r"\w{4,}", text.lower())} - GENERIC_WORDS) | numbers
+
+
+def element_names(raw):
+    """Namen aller Teilprüfungen und Lehrveranstaltungs-Angebote unterhalb eines Moduls."""
+    for c in raw.get("children") or []:
+        yield val(c.get("name"))
+        yield from element_names(c)
+
+
+def match_achievements(modules, achievements, title):
+    """{Modul: [Leistungen]}. RWTHonline verknüpft beides nicht, also nach Wortüberschneidung mit Modul-,
+    Teilprüfungs- und LV-Namen; seltene Wörter zählen mehr (Fachnamen wie „Soziologie“ stehen in vielen
+    Modulen). Jede Leistung bzw. Anmeldung nur beim am besten passenden Modul."""
+    names = {m: words(m.name + " " + " ".join(element_names(m.raw))) for m in modules}
+    df = {}
+    for ws in names.values():
+        for w in ws:
+            df[w] = df.get(w, 0) + 1
+    result = {}
+    for a in achievements:
+        mine = words(title(a))
+        score = lambda m: sum(1 / df[w] for w in names[m] & mine)
+        best = max(names, key=score, default=None)
+        if best and score(best):
+            result.setdefault(best, []).append(a)
+    return result
 
 
 def match_failed(modules, achievements, title):
-    """{Modul: nicht bestandene Leistung}. RWTHonline verknüpft beides nicht, also nach Wortüberschneidung
-    mit Modul- und Teilprüfungsnamen der nicht bestandenen Module; jede Leistung nur beim am besten passenden."""
-    names = {m: words(m.name + " " + " ".join(val(e.get("name")) for e in m.exams())) for m in modules if m.failed}
-    result = {}
-    for a in achievements:
-        best = max(names, key=lambda m: len(names[m] & words(title(a))), default=None)
-        if best and names[best] & words(title(a)):
-            result.setdefault(best, a)
-    return result
+    """{nicht bestandenes Modul: erste passende nicht bestandene Leistung}."""
+    return {m: found[0] for m, found in match_achievements([m for m in modules if m.failed], achievements, title).items()}

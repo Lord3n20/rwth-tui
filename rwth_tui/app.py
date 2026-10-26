@@ -12,7 +12,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, TabbedContent, TabPane
 
 from .api import SITE, NotLoggedIn, Rwth, RwthError
-from .plan import PlanStore, add_terms, build_modules, match_failed, next_key, prev_key, sort_modules
+from .plan import PlanStore, add_terms, build_modules, match_achievements, match_failed, next_key, prev_key, sort_modules
 
 ALL = "alle"
 STATUS = {"FIX": "Fixplatz", "BW": "beworben", "VOE": "vorgemerkt"}
@@ -23,6 +23,7 @@ AREA_SHORT = {"Pflichtbereich": "Pflicht", "Ergänzungsbereich": "Ergänzung", "
 PLAN_ACTIONS = {"plan_later", "plan_earlier", "plan_remove", "toggle_uni", "toggle_done"}
 AREA_PREFIXES = ("Wahlpflicht", "Pflicht", "Ergänzung", "Wahl", "Zusatz")
 ECTS_PER_TERM = 30  # Empfehlung der Uni: 30 ECTS je Semester
+BOOKED = "#d787ff"  # lila: Vorlesung/Seminar im Semester belegt
 
 
 def val(obj):
@@ -140,7 +141,7 @@ class RwthApp(App):
         self.studies, self.study_index = [], 0
         self.all_achievements, self.terms, self.current = [], [], None
         self.shown_achievements, self.regs, self.exams = [], [], []
-        self.reg_cache, self.progress = {}, {}
+        self.reg_cache, self.progress, self.loose_courses = {}, {}, {}
         self.modules, self.areas, self.plan_errors = {}, {}, {}
         self.plan_rows, self.plan_store = [], PlanStore()
         self.show_uni, self.show_done = False, False
@@ -199,6 +200,8 @@ class RwthApp(App):
             return
         modules = build_modules(open_modules, semester_plan)
         self.count_attempts(modules, study["studyId"])
+        self.assign_done_terms(modules, study["studyId"])
+        self.assign_courses(modules, study["studyId"])
         self.plan_store.apply(study["studyId"], modules, self.current["key"])
         self.modules[study["studyId"]], self.areas[study["studyId"]] = modules, areas
         self.call_from_thread(self.fill_terms)
@@ -215,6 +218,40 @@ class RwthApp(App):
                 m.attempts, m.max_attempts = result["attemptCount"], result["parameters"]["maxAttempts"]
             except (RwthError, KeyError, TypeError):
                 m.attempts = 1
+
+    def assign_done_terms(self, modules, study_id):
+        """Bestandenen Modulen das Semester ihrer passenden bestandenen Leistung geben (für den Rückblick im Plan)."""
+        passed = [a for a in self.all_achievements
+                  if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id and counts(a)]
+        title = lambda a: val((a.get("cpCourseLibDto") or {}).get("courseTitle")) or val(a.get("subject"))
+        for m, found in match_achievements([m for m in modules if m.done], passed, title).items():
+            m.done_term = max(a["semesterLibDto"]["key"] for a in found)
+
+    def assign_courses(self, modules, study_id):
+        """LV-Anmeldungen vom Studienbeginn bis zum aktuellen Semester laden und den Modulen zuordnen
+        (Worker-Thread). RWTHonline sagt nicht, zu welchem Studiengang eine Anmeldung gehört; was zu keinem
+        Modul passt, landet in self.loose_courses und erscheint nur im Detail der Semester-Überschrift."""
+        keys = [a["semesterLibDto"]["key"] for a in self.all_achievements
+                if (a.get("studyBasicInfoLibDto") or {}).get("id") == study_id]
+        start = min(keys + [self.current["key"]])
+        loose = self.loose_courses[study_id] = {}
+        title = lambda r: val(r["course"]["courseTitle"])
+        for term in self.all_semesters:
+            if not start <= term["key"] <= self.current["key"]:
+                continue
+            try:
+                regs = self.reg_cache.get(term["id"])
+                if regs is None:
+                    regs = self.reg_cache[term["id"]] = self.api.registrations(term["id"])
+            except RwthError:
+                continue
+            # schon in einem früheren Semester bestandene Module kommen nicht mehr in Frage
+            candidates = [m for m in modules if not (m.done and m.done_term and m.done_term < term["key"])]
+            found = match_achievements(candidates, regs, title)
+            for m, rs in found.items():
+                m.courses[term["key"]] = rs
+            matched = {id(r) for rs in found.values() for r in rs}
+            loose[term["key"]] = [r for r in regs if id(r) not in matched]
 
     @work(thread=True, exclusive=True, group="regs")
     def load_registrations(self, term):
@@ -307,13 +344,16 @@ class RwthApp(App):
             e, _ = summary([a for a in mine if a["semesterLibDto"]["key"] == t["key"]])
             planned = self.planned_ects(t["key"])
             mark = " [b yellow]●[/]" if t["id"] == self.current["id"] else ""
-            if e or planned:
+            if t["key"] < self.current["key"]:  # abgeschlossenes Semester
+                right = f"[green]{e:>3}[/][dim]/{ECTS_PER_TERM}[/]"
+            elif e or planned:
                 number = f"{e + planned:>3}"
                 right = (f"[cyan]{number}[/]" if planned else number) + f"[dim]/{ECTS_PER_TERM}[/]"
             else:
                 right = "  –"
             fs = self.fachsemester(t["key"])
-            lv.append(ListItem(Label(f"[dim]{fs:>2}.[/] {term_label(t['key']):<12}{right}{mark}")))
+            name = f"[green]{term_label(t['key']):<12}[/]" if t["key"] < self.current["key"] else f"{term_label(t['key']):<12}"
+            lv.append(ListItem(Label(f"[dim]{fs:>2}.[/] {name}{right}{mark}")))
         # Start: Gesamt (Anmeldungen dann vom aktuellen Semester); sonst gewähltes Semester behalten
         lv.index = next((i + 1 for i, t in enumerate(self.terms) if t["key"] == old), 0)
         self.show_term()
@@ -406,12 +446,14 @@ class RwthApp(App):
         self.refresh_detail()
 
     def show_plan(self, keep=None):
-        """Semesterplan: je Semester (ab dem aktuellen) eine Überschrift mit ECTS/30 und die dort
-        verplanten Module, danach „nicht geplant“. u blendet Uni-Vorschläge ein, e Erledigtes;
+        """Semesterplan: je Semester eine Überschrift mit ECTS/30, danach „nicht geplant“. Abgeschlossene
+        Semester (grün) zeigen, was dort bestanden und belegt wurde und was aus dem Uni-Plan dafür noch fehlt;
+        ab dem aktuellen die verplanten und belegten Module. u blendet Uni-Vorschläge ein, e Erledigtes;
         bei gewähltem Semester nur dessen Abschnitt. keep = Cursor-Modul."""
         table = self.query_one("#plan", DataTable)
         total_label = self.query_one("#plan-sum", Label)
-        keep = keep or self.selected_module()
+        if keep is None and table.row_count and table.cursor_row < len(self.plan_rows):
+            keep = self.plan_rows[table.cursor_row][1]  # Modul oder Semester-Überschrift unter dem Cursor
         table.clear()
         self.plan_rows = []
         study, modules = self.study(), self.study_modules()
@@ -427,14 +469,21 @@ class RwthApp(App):
         term = self.selected_term()
         open_ = [m for m in modules if not m.done]
 
-        def add_module(m, uni_only=False):
-            mark, color = self.module_style(m)
+        def add_module(m, uni_only=False, key=None, note=""):
+            mark, color = self.module_style(m, key)
             ects = f"{m.achieved}/{m.total}" if m.achieved and not m.done else str(m.total)
             uni = self.uni_keys(m)
             uni_text = f"{m.rec_terms[0]}." + ("+" if len(uni) > 1 else "") if uni else ""
             if m.planned and uni and m.planned > uni[-1] and not m.done:
                 uni_text = f"[#ffd700]{uni_text}[/]"  # später geplant als die Uni vorschlägt
             name = f"[{color}]{escape(m.name)}[/]" + (f"  [dim]Note {m.grade}[/]" if m.grade and m.done else "")
+            if key and m.courses.get(key) and not (m.done and m.done_term == key):
+                types = sorted({r["course"]["courseTypeDto"]["key"] for r in m.courses[key]})
+                name += f"  [{BOOKED}]({'/'.join(types)})[/]"
+            if key and m.done and m.done_term != key:
+                note = f"(bestanden {term_label(m.done_term)})" if m.done_term else "(bestanden)"
+            if note:
+                name += f"  [dim]{note}[/]"
             if uni_only:
                 name = f"[dim]{escape(m.name)}  (Uni)[/]"
             table.add_row(f"[{color}]{mark}[/]", ects, uni_text, name)
@@ -450,22 +499,26 @@ class RwthApp(App):
             for m in done:
                 add_module(m)
 
-        keys = [t["key"] for t in sorted(self.terms, key=lambda t: t["key"]) if t["key"] >= self.current["key"]]
+        keys = [t["key"] for t in sorted(self.terms, key=lambda t: t["key"])]
         for key in ([term["key"]] if term else keys):
+            if key < self.current["key"]:
+                self.add_past_term(key, modules, heading, add_module)
+                continue
             ects = self.planned_ects(key)
             color = "yellow" if ects > ECTS_PER_TERM else "cyan" if ects else "dim"
             heading(f"{self.fachsemester(key)}. {term_label(key)}", f"[{color}]{ects}[/][dim]/{ECTS_PER_TERM}[/]",
                     ("term", key))
             mine = [m for m in open_ if m.planned == key]
+            mine += [m for m in modules if m.courses.get(key) and m not in mine]  # belegt, aber anders geplant
             for m in mine:
-                add_module(m)
+                add_module(m, key=key)
             if self.show_uni:
                 for m in modules:
                     if key in self.uni_keys(m) and m not in mine:
                         add_module(m, uni_only=True)
 
         if not term:
-            loose = [m for m in open_ if not m.planned]
+            loose = [m for m in open_ if not m.planned and self.current["key"] not in m.courses]  # Belegtes steht oben
             heading(f"nicht geplant ({len(loose)})")
             for area, need in self.area_needs(modules):
                 choice = [m for m in loose if m.area == area]
@@ -481,17 +534,36 @@ class RwthApp(App):
                     add_module(m)
 
         rows = [r[1] for r in self.plan_rows]
-        if keep in rows:
+        if keep is not None and keep in rows:
             table.move_cursor(row=rows.index(keep))
+        elif self.current["key"] in rows:  # Start: aktuelles Semester, abgeschlossene darüber
+            table.move_cursor(row=rows.index(self.current["key"]))
         self.refresh_detail()
 
+    def add_past_term(self, key, modules, heading, add_module):
+        """Abgeschlossenes Semester: dort Bestandenes, dort Belegtes, dann der Uni-Plan fürs Fachsemester."""
+        e, _ = summary([a for a in self.study_achievements() if a["semesterLibDto"]["key"] == key])
+        heading(f"[green]{self.fachsemester(key)}. {term_label(key)} ✓[/]", f"[green]{e}[/][dim]/{ECTS_PER_TERM}[/]",
+                ("term", key))
+        shown = [m for m in modules if m.done and m.done_term == key]
+        shown += [m for m in modules if m.courses.get(key) and m not in shown]
+        for m in shown:
+            add_module(m, key=key)
+        for m in modules:
+            if key in self.uni_keys(m) and m not in shown:
+                add_module(m, key=key, note="" if m.done else
+                           "fehlt" + (f" → {term_label(m.planned)}" if m.planned else ""))
+
     @staticmethod
-    def module_style(m):
-        """Symbol und Farbe: grün bestanden, orange/rot 1/≥2 Fehlversuche, blau läuft, geplant normal, sonst grau."""
+    def module_style(m, key=None):
+        """Symbol und Farbe: grün bestanden, orange/rot 1/≥2 Fehlversuche, lila in Semester key belegt
+        (LV-Anmeldung), blau läuft (Teilleistung/Prüfung), geplant normal, sonst grau."""
         if m.done:
             return "✓", "green"
         if m.failed:  # orange nach einem Fehlversuch, rot ab dem zweiten
             return "✗", "red" if m.attempts >= 2 else "#ff8c00"
+        if key and m.courses.get(key):
+            return "◆", BOOKED
         if m.status == "IN_PROGRESS" or m.achieved:
             return "▶", "#5fafff"
         return "○", "default" if m.planned else "dim"
@@ -514,7 +586,14 @@ class RwthApp(App):
         mine = [m for m in modules if m.planned == key and not m.done]
         uni = [m for m in modules if key in self.uni_keys(m)]
         done, planned = self.ects_until(key)
-        lines = [f"## {term_label(key)} – {fs}. Fachsemester", "",
+        if key < self.current["key"]:
+            e, _ = summary([a for a in self.study_achievements() if a["semesterLibDto"]["key"] == key])
+            lines = [f"## {term_label(key)} – {fs}. Fachsemester (abgeschlossen)", "",
+                     f"- Erreicht: **{e} ECTS** (Uni empfiehlt {ECTS_PER_TERM})",
+                     f"- Bis hier: du **{done}** ECTS, Uni {fs * ECTS_PER_TERM}"]
+        else:
+            lines = None
+        lines = lines or [f"## {term_label(key)} – {fs}. Fachsemester", "",
                  f"- Geplant: **{sum(m.remaining for m in mine)} ECTS** in {len(mine)} Modulen "
                  f"(Uni empfiehlt {ECTS_PER_TERM})",
                  f"- Bis hier: du **{done + planned}** ECTS ({done} erreicht + {planned} geplant), "
@@ -525,6 +604,14 @@ class RwthApp(App):
                 where = ("erledigt" if m.done else "hier geplant" if m.planned == key else
                          f"geplant {term_label(m.planned)}" if m.planned else "nicht geplant")
                 lines.append(f"- {escape(m.name)} ({m.total} ECTS) – _{where}_")
+        booked = [(m.name, r) for m in modules for r in m.courses.get(key, [])]
+        loose = self.loose_courses.get(self.study()["studyId"], {}).get(key, [])
+        if booked or loose:
+            lines += ["", "### Belegte Lehrveranstaltungen", ""]
+            lines += [f"- {r['course']['courseTypeDto']['key']} {escape(val(r['course']['courseTitle']))} "
+                      f"→ _{escape(name)}_" for name, r in booked]
+            lines += [f"- {r['course']['courseTypeDto']['key']} {escape(val(r['course']['courseTitle']))} "
+                      f"→ _kein Modul erkannt_" for r in loose]
         return "\n".join(lines)
 
     def plan_sum(self, modules):
@@ -626,6 +713,12 @@ class RwthApp(App):
                          f"({', '.join(term_label(k) for k in self.uni_keys(m))})")
         if not m.done:
             lines.append(f"- Geplant: {term_label(m.planned) if m.planned else '–'}")
+        elif m.done_term:
+            lines.append(f"- Bestanden: {term_label(m.done_term)}")
+        for key, regs in sorted(m.courses.items()):
+            for r in regs:
+                lines.append(f"- Belegt {term_label(key)}: {r['course']['courseTypeDto']['key']} "
+                             f"{escape(val(r['course']['courseTitle']))}")
 
         def parts(children, depth):
             for c in children:
