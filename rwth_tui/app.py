@@ -115,7 +115,7 @@ class RwthApp(App):
         self.studies, self.study_index = [], 0
         self.all_achievements, self.terms, self.current = [], [], None
         self.shown_achievements, self.regs, self.exams = [], [], []
-        self.reg_cache = {}
+        self.reg_cache, self.progress = {}, {}
         self.query_one("#achievements", DataTable).add_columns("Semester", "Datum", "Note", "ECTS", "Leistung")
         self.query_one("#registrations", DataTable).add_columns("Art", "Status", "Abmelden bis", "Gruppe", "Lehrveranstaltung")
         self.query_one("#exams", DataTable).add_columns("Datum", "Prüfung", "Status")
@@ -143,6 +143,8 @@ class RwthApp(App):
             current = self.api.current_term()
             semesters = self.api.semesters()
             self.call_from_thread(self.show_overview, studies, achievements, current, semesters)
+            progress = {s["studyId"]: self.api.study_progress(s) for s in studies if s.get("myStudyLink")}
+            self.call_from_thread(self.show_progress, progress)
             exams = self.api.registered_exams()
             self.call_from_thread(self.show_exams, exams)
         except RwthError as e:
@@ -185,12 +187,8 @@ class RwthApp(App):
                     s["id"] == self.current["id"] + 1) if self.all_semesters else self.current["key"]
         self.terms = sorted((s for s in self.all_semesters if first <= s["key"] <= upper),
                             key=lambda s: s["key"], reverse=True) or [self.current]
-        ects, avg = summary(mine)
-        study = self.study()
-        name = val(study["intendedDegree"]) + " · " + val(study["name"]) if study else "RWTHonline"
-        avg_text = f" · Ø {fmt_grade(avg)}" if avg else ""
-        more = f"  [dim](s: {len(self.studies)} Studiengänge)[/]" if len(self.studies) > 1 else ""
-        self.query_one("#study", Label).update(f"[b]{escape(name)}[/] · {ects} ECTS{avg_text}{more}")
+        ects, _ = summary(mine)
+        self.show_header()
 
         lv = self.query_one("#terms", ListView)
         index = lv.index
@@ -203,6 +201,27 @@ class RwthApp(App):
                                      f"{term_label(t['key']):<12}   –{mark}")))
         lv.index = min(index or 0, len(self.terms))  # Start: Gesamt (Anmeldungen dann vom aktuellen Semester)
         self.show_term()
+
+    def show_progress(self, progress):
+        self.progress = progress
+        self.show_header()
+
+    def show_header(self):
+        """Schnitt und ECTS wie in „Mein Studium“; solange das lädt, selbst gerechnet (ECTS-gewichtet)."""
+        study = self.study()
+        ects, avg = summary(self.study_achievements())
+        name = val(study["intendedDegree"]) + " · " + val(study["name"]) if study else "RWTHonline"
+        info = self.progress.get(study["studyId"], {}) if study else {}
+        if info.get("totalCredits"):
+            text = f"{info.get('achievedCredits', ects)}/{info['totalCredits']} ECTS"
+        else:
+            text = f"{ects} ECTS"
+        if info.get("grade"):
+            text += f" · Ø {info['grade']}"
+        elif avg:
+            text += f" · Ø ≈{fmt_grade(avg)}"
+        more = f"  [dim](s: {len(self.studies)} Studiengänge)[/]" if len(self.studies) > 1 else ""
+        self.query_one("#study", Label).update(f"[b]{escape(name)}[/] · {text}{more}")
 
     def selected_term(self):
         index = self.query_one("#terms", ListView).index or 0

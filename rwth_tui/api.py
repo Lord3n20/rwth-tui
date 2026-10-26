@@ -118,6 +118,11 @@ class Rwth:
     def studies(self):
         return [r["content"]["CmStudyInfoDto"] for r in self.get("slc.cm.cs/student/myStudies/chooser")["resource"]]
 
+    def study_progress(self, study):
+        """Fortschritt laut „Mein Studium“: ECTS erreicht/gesamt und der offizielle Schnitt."""
+        path = study["myStudyLink"]["href"].split("/ee/rest/", 1)[1]
+        return self.get(path)["resource"][0]["content"]["myCurriculumElementDto"].get("progressInfo") or {}
+
     def current_term(self):
         return self.get("slc.lib.sm/currentTerm")["resource"][0]["content"]["semesterLibDto"]
 
