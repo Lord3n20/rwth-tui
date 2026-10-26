@@ -134,7 +134,8 @@ def sort_modules(modules):
 
 
 class PlanStore:
-    """{studyId: {Modulnummer: Semesterschlüssel}} in ~/.config/rwth-tui/plan.json."""
+    """{studyId: {Modulnummer: Semesterschlüssel}} in ~/.config/rwth-tui/plan.json, dazu "_courses"
+    (LV → Modul von Hand) und "_exams" ({studyId: [LV-ids mit Prüfung]})."""
 
     def __init__(self):
         try:
@@ -160,6 +161,16 @@ class PlanStore:
     def set_course(self, study_id, course_id, code):
         self.data.setdefault("_courses", {}).setdefault(str(study_id), {})[str(course_id)] = code
         self._save()
+
+    def exam_courses(self, study_id):
+        """{LV-id} – LV-Anmeldungen, in denen die Modul(teil)prüfung abgelegt wird (Taste p)."""
+        return set(self.data.get("_exams", {}).get(str(study_id), []))
+
+    def toggle_exam(self, study_id, course_id):
+        marked = self.exam_courses(study_id) ^ {str(course_id)}
+        self.data.setdefault("_exams", {})[str(study_id)] = sorted(marked)
+        self._save()
+        return str(course_id) in marked
 
     def set(self, study_id, module, key):
         module.planned, module.suggested = key, False

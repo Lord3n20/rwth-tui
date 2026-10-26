@@ -1,5 +1,6 @@
 """Textual-Oberfläche: Semester links, rechts Leistungen (Noten/ECTS), LV-Anmeldungen, Prüfungen und Studienplan."""
 
+import re
 import subprocess
 from datetime import datetime
 
@@ -27,6 +28,7 @@ PLAN_ACTIONS = {"plan_later", "plan_earlier", "plan_remove", "toggle_uni", "togg
 AREA_PREFIXES = ("Wahlpflicht", "Pflicht", "Ergänzung", "Wahl", "Zusatz")
 ECTS_PER_TERM = 30  # Empfehlung der Uni: 30 ECTS je Semester
 BOOKED = "#d787ff"  # lila: Vorlesung/Seminar im Semester belegt
+EXAM = "#ffd700"  # gelb: in dieser LV wird die Prüfung abgelegt (Taste p)
 PARTLY = "#5fd7af"  # türkis: schon ein Teil besucht/erreicht (z. B. 2 von 4 Seminaren), Rest läuft oder fehlt
 INDENT = "    "  # Module stehen eingerückt unter ihrer Semester-Überschrift
 
@@ -155,6 +157,7 @@ class RwthApp(App):
         Binding("u", "toggle_uni", "Uni-Vorschläge"),
         Binding("e", "toggle_done", "Erledigte"),
         Binding("z", "assign_course", "Modul zuordnen"),
+        Binding("p", "toggle_exam", "Prüfung hier"),
         Binding("tab", "focus_next", "Bereich wechseln", show=False),
         Binding("q", "quit", "Beenden"),
     ]
@@ -194,7 +197,7 @@ class RwthApp(App):
         self.query_one("#achievements", DataTable).add_columns("Semester", "Datum", "Note", "ECTS", "Leistung")
         self.query_one("#registrations", DataTable).add_columns("Art", "Status", "Abmelden bis", "Modul", "Lehrveranstaltung", "Gruppe")
         self.query_one("#exams", DataTable).add_columns("Datum", "Prüfung", "Status")
-        self.query_one("#plan", DataTable).add_columns("", "ECTS", "Uni", "Modul")
+        self.query_one("#plan", DataTable).add_columns("", "ECTS", "Uni", "LV", "Prüf.", "Modul")
         self.query_one("#terms", ListView).focus()
         self.action_refresh()
 
@@ -527,13 +530,15 @@ class RwthApp(App):
         self.refresh_detail()
 
     def module_cell(self, r):
-        """Zugeordnetes Modul einer LV-Anmeldung; ✎ = von Hand (Taste z)."""
+        """Zugeordnetes Modul einer LV-Anmeldung; ✎ = von Hand (Taste z), P = Prüfung hier (Taste p)."""
         study = self.study()
         if not study or study["studyId"] not in self.course_module:
             return ""
         cid = str(r["course"]["id"])
         m = self.course_module[study["studyId"]].get(cid)
         hand = " ✎" if cid in self.plan_store.course_overrides(study["studyId"]) else ""
+        if self.has_exam(r):
+            hand += f" [b {EXAM}]P[/]"
         name = "" if not m else m.name if len(m.name) <= 30 else m.name[:29] + "…"
         return (f"[{BOOKED}]{escape(name)}[/]" if m else "[dim]–[/]") + hand
 
@@ -584,7 +589,7 @@ class RwthApp(App):
             if key and m.courses.get(key) and not (m.done and m.done_term == key):
                 types = sorted({r["course"]["courseTypeDto"]["key"] for r in m.courses[key]})
                 name += f"  [{BOOKED}]({'/'.join(types)})[/]"
-            note = " · ".join(filter(None, [self.progress_note(m, key), note]))
+            lv, exam = ("", "") if uni_only else self.progress_cells(m, key)
             if key and m.done and m.done_term != key:
                 note = f"(bestanden {term_label(m.done_term)})" if m.done_term else "(bestanden)"
             if m.suggested and not uni_only and m.planned == key and not m.courses.get(key):
@@ -593,14 +598,14 @@ class RwthApp(App):
                 name += f"  [dim]{note}[/]"
             if uni_only:
                 name = f"[dim]{escape(m.name)}  (Uni)[/]"
-            table.add_row(f"[{color}]{mark}[/]", ects, uni_text, INDENT + name)  # eingerückt unter die Überschrift
+            table.add_row(f"[{color}]{mark}[/]", ects, uni_text, lv, exam, INDENT + name)  # eingerückt unter die Überschrift
             self.plan_rows.append(("module", m))
 
         def heading(text, right="", row=("info", None)):
             if table.row_count:  # Leerzeile trennt die Abschnitte
-                table.add_row("", "", "", "")
+                table.add_row("", "", "", "", "", "")
                 self.plan_rows.append(("info", None))
-            table.add_row("", right, "", f"[b]── {text} ──[/]")
+            table.add_row("", right, "", "", "", f"[b]── {text} ──[/]")
             self.plan_rows.append(row)
 
         if self.show_done and not term:
@@ -636,7 +641,7 @@ class RwthApp(App):
                     continue
                 if sum(m.remaining for m in choice) > need:  # Auswahl: nur ein Teil davon nötig
                     text = f"noch {need} ECTS wählen" if need else "reicht schon – die hier sind nicht nötig"
-                    table.add_row("", "", "", f"{INDENT}[i]{escape(area_short(area))}: {text}[/]")
+                    table.add_row("", "", "", "", "", f"{INDENT}[i]{escape(area_short(area))}: {text}[/]")
                     self.plan_rows.append(("info", None))
                 for m in choice:
                     add_module(m)
@@ -670,22 +675,44 @@ class RwthApp(App):
                         "nicht nötig" if m.area in full else "fehlt")
                 add_module(m, key=key, note=note)
 
-    def progress_note(self, m, key=None):
-        """Teils fertig: „LV 2 besucht + 2 jetzt von 4 · Prüfungen 0 von 2“. LVs und Prüfungen getrennt,
-        weil manche Module mehr LVs verlangen, als sie Prüfungen haben (Konflikt und Konsens: 4 SE, 2 MTP)."""
+    def progress_cells(self, m, key=None):
+        """Spalten LV und Prüf. für teils Fertiges: „2+2/4“ (LVs in früheren Semestern + in key / verlangt)
+        und „0/2 2P“ (bestandene/alle Teilprüfungen, P = per Taste p gewählte Prüfungs-LVs). Getrennt, weil
+        manche Module mehr LVs verlangen, als sie Prüfungen haben (Konflikt und Konsens: 4 SE, 2 MTP)."""
         key = key or self.current["key"]
         before, now = m.earlier_courses(key), len(m.courses.get(key, []))
-        if m.done or not before:
-            return ""
-        if m.parts and before >= m.parts:
-            text = f"LV alle {m.parts} besucht"
-        else:
-            text = f"LV {before} besucht" + (f" + {now} jetzt" if now else "") + (f" von {m.parts}" if m.parts else "")
-        exams = m.exams()
-        if len(exams) > 1:
+        chosen = sum(1 for regs in m.courses.values() for r in regs if self.has_exam(r))
+        if m.done or not (before or chosen):
+            return "", ""
+        lv = ""
+        if before or (m.parts or 0) > 1:
+            lv = (f"{before}+{now}" if before and now else str(before or now)) + (f"/{m.parts}" if m.parts else "")
+            if m.parts and before + now >= m.parts:
+                lv = f"[{PARTLY}]{lv}[/]"  # alle LVs besucht oder belegt
+        exams, exam = m.exams(), ""
+        if len(exams) > 1 or chosen:
             passed = sum(1 for e in exams if (e.get("progressInfo") or {}).get("success"))
-            text += f" · Prüfungen {passed} von {len(exams)}"
-        return text
+            exam = f"{passed}/{len(exams)}"
+            if chosen:
+                exam += f" [{'red' if exams and chosen > len(exams) else EXAM}]{chosen}P[/]"
+        return lv, exam
+
+    def progress_note(self, m):
+        """Dasselbe in Worten fürs Detail."""
+        key = self.current["key"]
+        before, now = m.earlier_courses(key), len(m.courses.get(key, []))
+        chosen = sum(1 for regs in m.courses.values() for r in regs if self.has_exam(r))
+        if m.done or not (before or chosen):
+            return ""
+        exams = m.exams()
+        passed = sum(1 for e in exams if (e.get("progressInfo") or {}).get("success"))
+        return " · ".join(filter(None, [
+            f"LV {before} besucht" + (f", {now} jetzt belegt" if now else "") + (f", {m.parts} verlangt" if m.parts else ""),
+            f"Prüfungen {passed} von {len(exams)} bestanden" + (f", in {chosen} LV geplant (p)" if chosen else "")]))
+
+    def has_exam(self, r):
+        study = self.study()
+        return bool(study) and str(r["course"]["id"]) in self.plan_store.exam_courses(study["studyId"])
 
     def module_style(self, m, key=None):
         """Symbol und Farbe: grün bestanden, orange/rot 1/≥2 Fehlversuche, türkis teils fertig (LVs aus
@@ -830,6 +857,7 @@ class RwthApp(App):
                  f"- Abmeldung bis: {fmt_dt(r.get('deregistrationEnd'))}"
                  + ("" if r.get("deregistrationFlag") else " (nicht mehr möglich)"),
                  f"- Platzvergabe: {fmt_dt(r.get('allocationDate'))}",
+                 f"- Prüfung: " + ("**hier** (p nimmt es zurück)" if self.has_exam(r) else "nicht hier (p: hier ablegen)"),
                  f"- Studium: {val((r.get('studyProgramme') or {}).get('displayName'))}",
                  "", "_o: im Browser (dort ab- oder ummelden)_"]
         return "\n".join(lines)
@@ -856,7 +884,7 @@ class RwthApp(App):
         for key, regs in sorted(m.courses.items()):
             for r in regs:
                 lines.append(f"- Belegt {term_label(key)}: {r['course']['courseTypeDto']['key']} "
-                             f"{escape(val(r['course']['courseTitle']))}")
+                             f"{escape(val(r['course']['courseTitle']))}" + (" · **Prüfung hier**" if self.has_exam(r) else ""))
 
         def parts(children, depth):
             for c in children:
@@ -881,7 +909,8 @@ class RwthApp(App):
     # ------------------------------------------------------------------ Planen
 
     def check_action(self, action, parameters):
-        tab = {**{a: "tab-plan" for a in PLAN_ACTIONS}, "assign_course": "tab-registrations"}.get(action)
+        tab = {**{a: "tab-plan" for a in PLAN_ACTIONS}, "assign_course": "tab-registrations",
+               "toggle_exam": "tab-registrations"}.get(action)
         if tab:
             try:
                 return self.query_one("#tabs", TabbedContent).active == tab
@@ -951,6 +980,18 @@ class RwthApp(App):
             self.show_plan()
 
         self.push_screen(ModulePicker(course_title(r), choices), chosen)
+
+    def action_toggle_exam(self):
+        """LV-Anmeldung unter dem Cursor als die markieren, in der die Prüfung abgelegt wird (nur lokal)."""
+        study, table = self.study(), self.query_one("#registrations", DataTable)
+        if not study or not self.regs or table.cursor_row >= len(self.regs):
+            return
+        r, row = self.regs[table.cursor_row], table.cursor_row
+        on = self.plan_store.toggle_exam(study["studyId"], r["course"]["id"])
+        self.notify(f"Prüfung {'hier' if on else 'nicht mehr hier'}: {val(r['course']['courseTitle'])}", timeout=3)
+        self.show_registrations(self.selected_term() or self.current, self.regs)
+        table.move_cursor(row=row)
+        self.show_plan()
 
     def action_plan_remove(self):
         m = self.selected_module()

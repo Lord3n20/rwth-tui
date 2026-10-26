@@ -60,11 +60,15 @@ Eine abgelaufene Sitzung meldet das Programm still neu an. `rwth logout` löscht
 | `u` | Vorschläge aus dem Semesterplan der Uni einblenden |
 | `e` | Erledigte Module einblenden |
 | `z` | LV-Anmeldung von Hand einem Modul zuordnen (Reiter Anmeldungen) |
+| `p` | In dieser LV die Prüfung ablegen (Reiter Anmeldungen, gelbes P) – z. B. 2 von 4 Seminaren |
 | `r` | Neu laden |
 
-Farben im Plan: grün bestanden, türkis ◐ teils fertig (z. B. „LV 2 besucht + 2 jetzt von 4 · Prüfungen 0 von 2“), lila belegt
-(LV-Anmeldung), blau läuft, orange/rot nach 1/≥2
-Fehlversuchen, grau ungeplant.
+Farben im Plan: grün bestanden, türkis ◐ teils fertig, lila belegt (LV-Anmeldung), blau läuft,
+orange/rot nach 1/≥2 Fehlversuchen, grau ungeplant.
+
+Spalten LV und Prüf. für teils fertige Module: „2+2/4“ = LVs in früheren Semestern besucht + jetzt belegt /
+verlangt; „0/2 2P“ = bestandene / alle Teilprüfungen, dazu die per `p` gewählten Prüfungs-LVs (rot bei zu
+vielen). Für Module wie „Konflikt und Konsens“: 4 Seminare besuchen, in 2 davon die Prüfung.
 
 RWTHonline verknüpft LV-Anmeldungen und Leistungen nicht direkt mit Modulen. Anmeldungen werden über
 ihr Anmeldeverfahren zugeordnet (heißt oft wie das Modul), Leistungen über die angemeldete LV, sonst

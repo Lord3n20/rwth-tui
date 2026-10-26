@@ -79,6 +79,12 @@ async def main():
             store = json.loads((OUT / "config/rwth-tui/plan.json").read_text())["_courses"]
             print("von Hand zugeordnet:", store)
             assert plain(regs.get_row_at(0)[3]).endswith("✎"), "Spalte Modul zeigt die Zuordnung nicht"
+            await pilot.press("p")  # in der ersten LV die Prüfung ablegen
+            await pilot.pause(0.3)
+            exams = json.loads((OUT / "config/rwth-tui/plan.json").read_text())["_exams"]
+            print("Prüfung markiert:", exams)
+            assert plain(regs.get_row_at(0)[3]).endswith("P"), "p markiert keine Prüfung"
+            dump(app.query_one("#plan"))
     print("Screenshots in", OUT)
 
 
