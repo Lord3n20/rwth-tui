@@ -584,10 +584,7 @@ class RwthApp(App):
             if key and m.courses.get(key) and not (m.done and m.done_term == key):
                 types = sorted({r["course"]["courseTypeDto"]["key"] for r in m.courses[key]})
                 name += f"  [{BOOKED}]({'/'.join(types)})[/]"
-            begun = 0 if m.done else m.earlier_courses(key or self.current["key"])
-            if begun:
-                note = " · ".join(filter(None, [f"{begun} von {m.parts} schon besucht" if m.parts else
-                                              f"{begun} LV schon besucht", note]))
+            note = " · ".join(filter(None, [self.progress_note(m, key), note]))
             if key and m.done and m.done_term != key:
                 note = f"(bestanden {term_label(m.done_term)})" if m.done_term else "(bestanden)"
             if m.suggested and not uni_only and m.planned == key and not m.courses.get(key):
@@ -672,6 +669,23 @@ class RwthApp(App):
                 note = ("" if m.done else f"fehlt → {term_label(m.planned)}" if m.planned else
                         "nicht nötig" if m.area in full else "fehlt")
                 add_module(m, key=key, note=note)
+
+    def progress_note(self, m, key=None):
+        """Teils fertig: „LV 2 besucht + 2 jetzt von 4 · Prüfungen 0 von 2“. LVs und Prüfungen getrennt,
+        weil manche Module mehr LVs verlangen, als sie Prüfungen haben (Konflikt und Konsens: 4 SE, 2 MTP)."""
+        key = key or self.current["key"]
+        before, now = m.earlier_courses(key), len(m.courses.get(key, []))
+        if m.done or not before:
+            return ""
+        if m.parts and before >= m.parts:
+            text = f"LV alle {m.parts} besucht"
+        else:
+            text = f"LV {before} besucht" + (f" + {now} jetzt" if now else "") + (f" von {m.parts}" if m.parts else "")
+        exams = m.exams()
+        if len(exams) > 1:
+            passed = sum(1 for e in exams if (e.get("progressInfo") or {}).get("success"))
+            text += f" · Prüfungen {passed} von {len(exams)}"
+        return text
 
     def module_style(self, m, key=None):
         """Symbol und Farbe: grün bestanden, orange/rot 1/≥2 Fehlversuche, türkis teils fertig (LVs aus
@@ -836,6 +850,9 @@ class RwthApp(App):
             lines.append(f"- Geplant: {term_label(m.planned) if m.planned else '–'}")
         elif m.done_term:
             lines.append(f"- Bestanden: {term_label(m.done_term)}")
+        progress = self.progress_note(m)
+        if progress:
+            lines.append(f"- Fortschritt: {progress}")
         for key, regs in sorted(m.courses.items()):
             for r in regs:
                 lines.append(f"- Belegt {term_label(key)}: {r['course']['courseTypeDto']['key']} "
