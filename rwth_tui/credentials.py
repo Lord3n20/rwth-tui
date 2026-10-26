@@ -13,7 +13,9 @@ from urllib.parse import parse_qs, urlparse
 
 CREDENTIALS = Path.home() / ".config/rwth-tui/credentials.json"
 
-KEYS = {"user": "Benutzername (ab123456)", "password": "RWTH-Passwort", "totp": "TOTP-Geheimnis (Base32 oder otpauth://-Link)"}
+KEYS = {"user": "Benutzername (ab123456)", "password": "RWTH-Passwort", "totp": "TOTP-Geheimnis (Base32 oder otpauth://-Link)",
+        "token": "Beschreibung des TOTP-Tokens im IdM-Selfservice (leer = „tui“)"}
+DEFAULT_TOKEN = "tui"
 
 
 def _load():
@@ -35,6 +37,11 @@ def store(key, value):
 
 def lookup(key):
     return _load().get(key)
+
+
+def token_name():
+    """Beschreibung, an der die SSO-Seite das TOTP-Token zur Auswahl anbietet."""
+    return lookup("token") or DEFAULT_TOKEN
 
 
 def normalize_totp(value):
@@ -64,7 +71,7 @@ def setup(args):
             continue
         if key == "totp":
             value = normalize_totp(value)
-        store(key, value.strip() if key == "user" else value)
+        store(key, value.strip() if key in ("user", "token") else value)
         print(f"{key}: gespeichert ✓")
     return 0
 

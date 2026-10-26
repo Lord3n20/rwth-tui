@@ -6,13 +6,14 @@ localStorage ablegt. Sobald es dort liegt, geben wir es als JSON auf stdout aus
 und schließen das Fenster.
 
 Sind Zugangsdaten gespeichert (`rwth secret`), läuft das Ganze unsichtbar: die
-SSO-Seiten werden selbst ausgefüllt, inklusive TOTP-Code vom Token „tui“.
+SSO-Seiten werden selbst ausgefüllt, inklusive TOTP-Code vom Token „tui“ (bzw. `rwth secret token`).
 Hakt etwas, erscheint das Fenster und man macht von Hand weiter. `--show` zeigt
 es von Anfang an.
 """
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -22,7 +23,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import GLib, Gtk, WebKit2  # noqa: E402
 
-from credentials import lookup, totp  # noqa: E402  (liegt neben diesem Skript)
+from credentials import lookup, token_name, totp  # noqa: E402  (liegt neben diesem Skript)
 
 START = "https://online.rwth-aachen.de/RWTHonline/co/co-desktop/app/login?post_login_base=ee&post_login_route=%2Flogin&onboarding=false"
 READ_STORAGE = "JSON.stringify(Object.assign({}, localStorage))"
@@ -34,7 +35,8 @@ MAX_FILLS = {"password": 1, "otp": 2, "other": 1, "select": 1}
 
 # Erkennt die SSO-Seite am Feldtyp statt an festen Namen. Gibt zurück, was es getan hat.
 FILL = """(function (c) {
-  const TOKEN = /\\btui\\b/i;  // Beschreibung des Tokens im IdM-Selfservice („tui“)
+  // Beschreibung des Tokens im IdM-Selfservice (Standard „tui“)
+  const TOKEN = new RegExp('\\\\b' + c.token + '\\\\b', 'i');  // c.token schon per re.escape maskiert
   const vis = e => e && e.offsetParent !== null && !e.disabled;
   const ins = [...document.querySelectorAll('input')].filter(vis);
   const fields = ins.map(e => [e.type, e.name || e.id, e.autocomplete].join(':'));
@@ -169,7 +171,7 @@ def main():
         left = 30 - int(time.time()) % 30
         if left < 4:
             return
-        c = dict(creds, code=totp(creds["totp"]), dry=bool(os.environ.get("RWTH_LOGIN_DRYRUN")),
+        c = dict(creds, token=re.escape(token_name()), code=totp(creds["totp"]), dry=bool(os.environ.get("RWTH_LOGIN_DRYRUN")),
                  skip=[k for k, n in fills.items() if n >= MAX_FILLS.get(k, 3)])
         del c["totp"]
         view.evaluate_javascript(FILL % json.dumps(c), -1, None, None, None, on_filled)

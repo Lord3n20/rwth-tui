@@ -2,7 +2,7 @@
 
 Kette: Keycloak CAMPUSonline_SP (Client co-desktop-user, PKCE wie keycloak-js)
 → Keycloak RWTHprod_IDP → Shibboleth sso.rwth-aachen.de (Passwort, dann TOTP
-vom Token „tui“) → SAML zurück → Session-Cookie von RWTHonline, mit dem
+vom Token „tui“ bzw. `rwth secret token`) → SAML zurück → Session-Cookie von RWTHonline, mit dem
 auth/token/refresh das Zugangs-Token liefert.
 
 Jede Seite wird an ihren Formularen erkannt, nicht an der URL. Passwort und Code
@@ -21,13 +21,12 @@ from urllib.parse import urlencode, urljoin
 
 import requests
 
-from .credentials import lookup, totp
+from .credentials import lookup, token_name, totp
 
 SITE = "https://online.rwth-aachen.de/RWTHonline"
 REALM = f"{SITE}/co/public/sec/auth/realms/CAMPUSonline_SP/protocol/openid-connect"
 CLIENT = "co-desktop-user"
 REDIRECT = f"{SITE}/ee/ui/ca2/app/desktop/#/login"
-TOKEN = re.compile(r"\btui\b", re.I)  # Beschreibung des Tokens im IdM-Selfservice
 DEBUG = bool(os.environ.get("RWTH_LOGIN_DEBUG"))
 
 
@@ -154,6 +153,7 @@ class Login:
 
     def step(self, r, url):
         page = Page(r.text)
+        token = re.compile(rf"\b{re.escape(token_name())}\b", re.I)  # Beschreibung des Tokens im IdM-Selfservice
         log("  Seite:", (re.search(r"<title>(.*?)</title>", r.text, re.S) or [None, "?"])[1].strip(), describe(page))
         for form in page.forms:
             names = {i["name"] for i in form["inputs"]}
@@ -164,13 +164,13 @@ class Login:
                 return self.submit(url, form, {"j_username": self.creds["user"], "j_password": self.creds["password"]},
                                    proceed or {"name": "_eventId_proceed", "value": ""})
             for s in form["selects"]:
-                o = next((o for o in s["options"] if TOKEN.search(o["text"])), None)
+                o = next((o for o in s["options"] if token.search(o["text"])), None)
                 if o:
                     self.once("select")
                     return self.submit(url, form, {s["name"]: o["value"]}, form["buttons"][0] if form["buttons"] else None)
             otp = next((i for i in visible if re.search(r"otp|totp|token|code", i["name"], re.I)), None)
             if otp:
-                if not TOKEN.search(page.plain()):
+                if not token.search(page.plain()):
                     other = next((b for b in form["buttons"] if re.search(r"andere auswahl|other", b["text"], re.I)), None)
                     if not other:
                         raise LoginError("Code-Seite für ein anderes Token, ohne „Andere Auswahl“.")
