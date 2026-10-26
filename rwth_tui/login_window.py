@@ -3,12 +3,18 @@
 Öffnet den OIDC-Login (der Shibboleth-Link liefert bei der RWTH 404). Nach dem SSO leitet RWTHonline auf die Web-App
 zurück, die den OAuth-Code selbst gegen ein Zugangs-Token tauscht und es im
 localStorage ablegt. Sobald es dort liegt, geben wir es als JSON auf stdout aus
-und schließen das Fenster. Passwort und 2FA bleiben im Fenster.
+und schließen das Fenster.
+
+Sind Zugangsdaten gespeichert (`rwth secret`), läuft das Ganze unsichtbar: die
+SSO-Seiten werden selbst ausgefüllt, inklusive TOTP-Code vom Token „rwth-tui“.
+Hakt etwas, erscheint das Fenster und man macht von Hand weiter. `--show` zeigt
+es von Anfang an.
 """
 
 import json
 import os
 import sys
+import time
 
 import gi
 
@@ -16,18 +22,85 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import GLib, Gtk, WebKit2  # noqa: E402
 
+from credentials import lookup, totp  # noqa: E402  (liegt neben diesem Skript)
+
 START = "https://online.rwth-aachen.de/RWTHonline/co/co-desktop/app/login?post_login_base=ee&post_login_route=%2Flogin&onboarding=false"
 READ_STORAGE = "JSON.stringify(Object.assign({}, localStorage))"
 DEBUG = bool(os.environ.get("RWTH_LOGIN_DEBUG"))
+GIVE_UP_AFTER = 45  # Sekunden ohne Erfolg → Fenster zeigen
+# Derselbe Schritt öfter → vermutlich falsches Passwort/Code. Passwort nur einmal, sonst droht Sperre;
+# der Code darf zweimal (Zeitfenster-Grenze).
+MAX_FILLS = {"password": 1, "otp": 2}
+
+# Erkennt die SSO-Seite am Feldtyp statt an festen Namen. Gibt zurück, was es getan hat.
+FILL = """(function (c) {
+  const vis = e => e && e.offsetParent !== null && !e.disabled;
+  const ins = [...document.querySelectorAll('input')].filter(vis);
+  const fields = ins.map(e => [e.type, e.name || e.id, e.autocomplete].join(':'));
+  const out = step => JSON.stringify({step, fields});
+  const set = (e, v) => {
+    e.focus(); e.value = v;
+    e.dispatchEvent(new Event('input', {bubbles: true}));
+    e.dispatchEvent(new Event('change', {bubbles: true}));
+  };
+  const submit = e => {
+    const f = e.form;
+    const b = f && f.querySelector('button[type=submit], input[type=submit], button:not([type])');
+    if (b) b.click(); else if (f) f.requestSubmit();
+  };
+  for (const s of document.querySelectorAll('select')) {
+    const o = [...s.options].find(o => /rwth-tui/i.test(o.text));
+    if (vis(s) && o && s.value !== o.value) {
+      s.value = o.value; s.dispatchEvent(new Event('change', {bubbles: true}));
+      return out('select');
+    }
+  }
+  const pw = ins.find(e => e.type === 'password');
+  if (pw && !/otp|totp|token|code/i.test(pw.name + ' ' + pw.id)) {
+    if (c.dry || c.skip.includes('password')) return JSON.stringify({step: 'dry', buttons: [...document.querySelectorAll('button, input[type=submit]')]
+      .map(b => [b.type, b.name, b.value, b.textContent.trim(), b.form === pw.form].join('|')),
+      errors: [...document.querySelectorAll('.error, .alert, [role=alert], .output--error, .form-error')].map(e => e.innerText.trim()).filter(Boolean)});
+    const u = ins.find(e => e !== pw && /^(text|email)$/.test(e.type));
+    if (u) set(u, c.user);
+    set(pw, c.password); submit(pw);
+    return out('password');
+  }
+  if (c.code && !c.skip.includes('otp')) {
+    const otp = ins.find(e => e.autocomplete === 'one-time-code'
+      || (/otp|totp|token|code/i.test(e.name + ' ' + e.id) && /^(text|number|tel|password)$/.test(e.type)));
+    if (otp) { set(otp, c.code); submit(otp); return out('otp'); }
+  }
+  const broker = document.querySelector('a[href*="/broker/rwth-sso/"]');  // Keycloak: „RWTH Single Sign On“
+  if (broker) { location.href = broker.href; return out('broker'); }
+  const pick = [...document.querySelectorAll('label, li, button, a')].find(e => vis(e) && /rwth-tui/i.test(e.textContent));
+  if (pick) { pick.click(); return out('pick'); }
+  return JSON.stringify({step: 'none', fields, title: document.title,
+    text: (document.body ? document.body.innerText : '').slice(0, 200),
+    links: [...document.querySelectorAll('a[href], button')].slice(0, 8).map(e => (e.textContent.trim() + ' ' + (e.getAttribute('href') || '')).slice(0, 90))});
+})(%s)"""
 
 
 def main():
+    creds = {k: lookup(k) for k in ("user", "password", "totp")}
+    auto = all(creds.values()) and "--show" not in sys.argv
     ctx = WebKit2.WebContext.new_ephemeral()
     view = WebKit2.WebView.new_with_context(ctx)
     win = Gtk.Window(title="RWTHonline – Anmeldung")
     win.set_default_size(900, 760)
     win.add(view)
+    hidden = auto  # Fenster bleibt ungezeigt (ein Offscreen-Fenster hätte kein OpenGL für WebKit)
     result = {}
+    fills = {}
+    ready = False  # erst nach fertig geladener Seite ausfüllen, nie zweimal dieselbe
+    started = time.monotonic()
+
+    def show(reason):
+        nonlocal hidden
+        if not hidden:
+            return
+        print(f"Automatische Anmeldung hakt ({reason}) – bitte im Fenster weitermachen.", file=sys.stderr)
+        hidden = False
+        win.show_all()
 
     def on_storage(obj, res):
         try:
@@ -52,7 +125,38 @@ def main():
         ]
         if DEBUG:
             print("cookies:", [(c["name"], c["path"]) for c in result["cookies"]], file=sys.stderr)
-        win.close()
+        Gtk.main_quit()
+
+    def on_filled(obj, res):
+        try:
+            info = json.loads(view.evaluate_javascript_finish(res).to_string())
+        except GLib.Error:
+            return
+        if DEBUG:
+            print("fill:", info, file=sys.stderr)
+        nonlocal ready
+        step = info["step"]
+        if step in ("broker", "password", "otp"):
+            ready = False
+        if step != "none":
+            fills[step] = fills.get(step, 0) + 1
+            if fills[step] > MAX_FILLS.get(step, 3):
+                show(f"Schritt „{step}“ wiederholt sich")
+
+    def on_load(_view, event):
+        nonlocal ready
+        if event == WebKit2.LoadEvent.FINISHED:
+            ready = True
+
+    def fill():
+        # Einen Code nicht kurz vor Ablauf abschicken – sonst ist er beim Server schon alt.
+        left = 30 - int(time.time()) % 30
+        if left < 4:
+            return
+        c = dict(creds, code=totp(creds["totp"]), dry=bool(os.environ.get("RWTH_LOGIN_DRYRUN")),
+                 skip=[k for k, n in fills.items() if n >= MAX_FILLS.get(k, 3)])
+        del c["totp"]
+        view.evaluate_javascript(FILL % json.dumps(c), -1, None, None, None, on_filled)
 
     def poll():
         uri = view.get_uri() or ""
@@ -60,12 +164,19 @@ def main():
             print("uri:", uri.split("?")[0], file=sys.stderr)
         if "online.rwth-aachen.de/RWTHonline/" in uri and "/sec/auth/" not in uri:
             view.evaluate_javascript(READ_STORAGE, -1, None, None, None, on_storage)
+        elif hidden and ready and not view.is_loading():
+            fill()
+        if hidden and time.monotonic() - started > GIVE_UP_AFTER:
+            show("dauert zu lange")
         return "access_token" not in result
 
-    win.connect("destroy", lambda *_: Gtk.main_quit())
+    view.connect("load-changed", on_load)
+    win.connect("delete-event", lambda *_: Gtk.main_quit())
     GLib.timeout_add(700, poll)
     view.load_uri(START)
-    win.show_all()
+    view.show()
+    if not hidden:
+        win.show_all()
     Gtk.main()
     if "cookies" not in result:
         return 1

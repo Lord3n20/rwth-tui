@@ -5,7 +5,7 @@ def main():
     args = sys.argv[1:]
     if args[:1] == ["login"]:
         from .login import login
-        return login()
+        return login(args[1:])
     if args[:1] == ["logout"]:
         from .login import logout
         return logout()
@@ -13,12 +13,12 @@ def main():
         from .dump import main as dump
         return dump(args[1:])
     if args[:1] == ["secret"]:
-        from .secrets import setup
+        from .credentials import setup
         return setup(args[1:])
     if args[:1] == ["code"]:
-        from .secrets import code
+        from .credentials import code
         return code(args[1:])
-    print("Aufruf: rwth [login | logout | dump [PFAD …] | secret [user|password|totp] | code]  (Ansicht folgt)")
+    print("Aufruf: rwth [login [--show] | logout | dump [PFAD …] | secret [user|password|totp] | code]  (Ansicht folgt)")
     return 2
 
 

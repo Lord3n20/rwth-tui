@@ -9,10 +9,14 @@ from .api import Rwth, RwthError, delete_session, save_session
 WINDOW = Path(__file__).with_name("login_window.py")
 
 
-def login():
-    print("Im Fenster über RWTH-SSO anmelden – es schließt sich danach von selbst.")
+def login(args=()):
+    from .credentials import lookup
+    if "--show" in args or not all(lookup(k) for k in ("user", "password", "totp")):
+        print("Im Fenster über RWTH-SSO anmelden – es schließt sich danach von selbst.")
+    else:
+        print("Melde automatisch an …")
     # /usr/bin/python3 statt venv: GTK/WebKit kommen aus den Arch-Paketen.
-    proc = subprocess.run(["/usr/bin/python3", str(WINDOW)], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.run(["/usr/bin/python3", str(WINDOW), *args], stdout=subprocess.PIPE, text=True)
     if proc.returncode != 0 or not proc.stdout.strip():
         print("Anmeldung abgebrochen.")
         return 1
