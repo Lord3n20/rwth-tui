@@ -1,6 +1,7 @@
 """Schlanker, rein lesender Client für die REST-Schnittstelle von RWTHonline (CAMPUSonline).
 
-Zugang = Token aus localStorage + Session-Cookie, beides vom Login-Fenster.
+Zugang = Token + Session-Cookie aus sso.py (oder dem Login-Fenster); läuft die
+Sitzung ab, meldet sich der Client mit den gespeicherten Zugangsdaten neu an.
 Absichtlich nur GET (plus Token-Erneuerung): Das Programm meldet nie etwas an
 oder ab, auch wenn das Token es dürfte.
 """
@@ -48,14 +49,26 @@ def delete_session():
 
 class Rwth:
     def __init__(self, session=None):
-        self.data = session or load_session()
-        if not self.data:
-            raise NotLoggedIn("Nicht angemeldet – erst `rwth login` ausführen.", "nosession")
         self.http = requests.Session()
         self.http.headers.update({"User-Agent": "rwth-tui", "Accept": "application/json"})
-        for c in self.data["cookies"]:
-            self.http.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"])
+        self._use(session or load_session() or self._relogin("nosession"))
         (CACHE_DIR / "json").mkdir(parents=True, exist_ok=True)
+
+    def _use(self, session):
+        self.data = session
+        self.http.cookies.clear()
+        for c in session["cookies"]:
+            self.http.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"])
+
+    def _relogin(self, code):
+        """Mit gespeicherten Zugangsdaten still neu anmelden (sso.py), sonst an `rwth login` verweisen."""
+        from .sso import Login, LoginError
+        try:
+            session = Login().run()
+        except LoginError as e:
+            raise NotLoggedIn(f"Nicht angemeldet ({e}) – `rwth login` ausführen.", code)
+        save_session(session)
+        return session
 
     def _get(self, path, params):
         return self.http.get(f"{REST}/{path.lstrip('/')}", params=params, timeout=20,
@@ -68,7 +81,8 @@ class Rwth:
                                     "Authorization": f"Bearer {self.data['access_token']}"})
         token = r.json().get("accessToken") if r.status_code == 201 else None
         if not token:
-            raise NotLoggedIn("Sitzung abgelaufen – `rwth login` ausführen.", "expired")
+            self._use(self._relogin("expired"))
+            return
         self.data["access_token"] = token
         self.data["cookies"] = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
                                 for c in self.http.cookies]
