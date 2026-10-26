@@ -6,7 +6,7 @@ localStorage ablegt. Sobald es dort liegt, geben wir es als JSON auf stdout aus
 und schließen das Fenster.
 
 Sind Zugangsdaten gespeichert (`rwth secret`), läuft das Ganze unsichtbar: die
-SSO-Seiten werden selbst ausgefüllt, inklusive TOTP-Code vom Token „rwth-tui“.
+SSO-Seiten werden selbst ausgefüllt, inklusive TOTP-Code vom Token „tui“.
 Hakt etwas, erscheint das Fenster und man macht von Hand weiter. `--show` zeigt
 es von Anfang an.
 """
@@ -30,10 +30,11 @@ DEBUG = bool(os.environ.get("RWTH_LOGIN_DEBUG"))
 GIVE_UP_AFTER = 45  # Sekunden ohne Erfolg → Fenster zeigen
 # Derselbe Schritt öfter → vermutlich falsches Passwort/Code. Passwort nur einmal, sonst droht Sperre;
 # der Code darf zweimal (Zeitfenster-Grenze).
-MAX_FILLS = {"password": 1, "otp": 2}
+MAX_FILLS = {"password": 1, "otp": 2, "other": 1, "select": 1}
 
 # Erkennt die SSO-Seite am Feldtyp statt an festen Namen. Gibt zurück, was es getan hat.
 FILL = """(function (c) {
+  const TOKEN = /\\btui\\b/i;  // Beschreibung des Tokens im IdM-Selfservice („tui“)
   const vis = e => e && e.offsetParent !== null && !e.disabled;
   const ins = [...document.querySelectorAll('input')].filter(vis);
   const fields = ins.map(e => [e.type, e.name || e.id, e.autocomplete].join(':'));
@@ -49,9 +50,10 @@ FILL = """(function (c) {
     if (b) b.click(); else if (f) f.requestSubmit();
   };
   for (const s of document.querySelectorAll('select')) {
-    const o = [...s.options].find(o => /rwth-tui/i.test(o.text));
-    if (vis(s) && o && s.value !== o.value) {
+    const o = [...s.options].find(o => TOKEN.test(o.text));
+    if (o) {
       s.value = o.value; s.dispatchEvent(new Event('change', {bubbles: true}));
+      submit(s);
       return out('select');
     }
   }
@@ -68,16 +70,25 @@ FILL = """(function (c) {
   if (c.code && !c.skip.includes('otp')) {
     const otp = ins.find(e => e.autocomplete === 'one-time-code'
       || (/otp|totp|token|code/i.test(e.name + ' ' + e.id) && /^(text|number|tel|password)$/.test(e.type)));
+    // Das SSO wählt gern ein anderes Token vor (z. B. Mail) – dann erst zur Token-Auswahl.
+    const other = [...document.querySelectorAll('a, button')].find(e => vis(e) && /andere auswahl|other selection/i.test(e.textContent));
+    if (otp && !TOKEN.test(document.body.innerText) && other) { other.click(); return out('other'); }
     if (otp) { set(otp, c.code); submit(otp); return out('otp'); }
   }
   const broker = document.querySelector('a[href*="/broker/rwth-sso/"]');  // Keycloak: „RWTH Single Sign On“
   if (broker) { location.href = broker.href; return out('broker'); }
-  const pick = [...document.querySelectorAll('label, li, button, a')].find(e => vis(e) && /rwth-tui/i.test(e.textContent));
+  const pick = [...document.querySelectorAll('label, li, button, a')].find(e => vis(e) && TOKEN.test(e.textContent));
   if (pick) { pick.click(); return out('pick'); }
   return JSON.stringify({step: 'none', fields, title: document.title,
+    options: [...document.querySelectorAll('select option, [role=option], input[type=radio], input[type=checkbox]')].map(o => [o.tagName, o.value, o.textContent.trim()].join('|')),
     text: (document.body ? document.body.innerText : '').slice(0, 200),
     links: [...document.querySelectorAll('a[href], button')].slice(0, 8).map(e => (e.textContent.trim() + ' ' + (e.getAttribute('href') || '')).slice(0, 90))});
 })(%s)"""
+
+
+def on_app(uri):
+    """RWTHonline selbst (nicht Keycloak unter /sec/auth/, nicht das SSO) – dort liegt irgendwann das Token."""
+    return "online.rwth-aachen.de/RWTHonline/" in uri and "/sec/auth/" not in uri
 
 
 def main():
@@ -93,6 +104,8 @@ def main():
     fills = {}
     ready = False  # erst nach fertig geladener Seite ausfüllen, nie zweimal dieselbe
     started = time.monotonic()
+    stuck = 0  # Takte auf der nackten Startseite – Keycloak springt sporadisch dorthin statt zum SSO
+    restarts = 0
 
     def show(reason):
         nonlocal hidden
@@ -136,7 +149,7 @@ def main():
             print("fill:", info, file=sys.stderr)
         nonlocal ready
         step = info["step"]
-        if step in ("broker", "password", "otp"):
+        if step in ("broker", "password", "otp", "other", "select"):
             ready = False
         if step != "none":
             fills[step] = fills.get(step, 0) + 1
@@ -147,6 +160,9 @@ def main():
         nonlocal ready
         if event == WebKit2.LoadEvent.FINISHED:
             ready = True
+            # Sofort statt erst beim nächsten poll(): die Keycloak-Seite springt sonst gelegentlich weiter.
+            if hidden and not on_app(view.get_uri() or ""):
+                fill()
 
     def fill():
         # Einen Code nicht kurz vor Ablauf abschicken – sonst ist er beim Server schon alt.
@@ -162,8 +178,16 @@ def main():
         uri = view.get_uri() or ""
         if DEBUG:
             print("uri:", uri.split("?")[0], file=sys.stderr)
-        if "online.rwth-aachen.de/RWTHonline/" in uri and "/sec/auth/" not in uri:
+        nonlocal stuck, restarts
+        if on_app(uri):
             view.evaluate_javascript(READ_STORAGE, -1, None, None, None, on_storage)
+            stuck = stuck + 1 if uri.rstrip("/").endswith("/RWTHonline") else 0
+            if hidden and stuck > 4 and restarts < 3:
+                restarts += 1
+                stuck = 0
+                if DEBUG:
+                    print("Neustart", restarts, file=sys.stderr)
+                view.load_uri(START)
         elif hidden and ready and not view.is_loading():
             fill()
         if hidden and time.monotonic() - started > GIVE_UP_AFTER:
