@@ -14,6 +14,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Label, ListItem, ListView, Markdown, OptionList, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 
+from . import farben
 from .api import SITE, NotLoggedIn, Rwth, RwthError, parallel
 from .plan import (Matcher, Module, PlanStore, add_terms, build_modules, match_achievements, match_failed,
                    match_registration, next_key, prev_key, sort_modules, suggest)
@@ -183,7 +184,15 @@ class RwthApp(App):
                     yield Markdown(id="detail")
         yield Footer()
 
+    def theme_gewechselt(self, theme):
+        farben.theme_merken(theme.name)
+
     def on_mount(self):
+        d = farben.lesen()
+        self.register_theme(farben.custom_theme(d.get("farben")))
+        if d.get("theme") in self.available_themes:
+            self.theme = d["theme"]
+        self.theme_changed_signal.subscribe(self, self.theme_gewechselt)
         self.api = None
         self.studies, self.study_index = [], 0
         self.all_achievements, self.terms, self.current = [], [], None
