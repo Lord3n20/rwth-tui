@@ -82,6 +82,18 @@ Endpunkte zu erkunden.
 
 Diagnose beim Login: `RWTH_LOGIN_DEBUG=1`, `RWTH_LOGIN_DRYRUN=1` (nichts abschicken).
 
+## Darstellung
+
+Das Theme lässt sich in der Befehlspalette wechseln (Strg+P → Theme) und wird in `~/.config/rwth-tui/farben.json`
+gemerkt. Neben den Textual-Themes gibt es „custom“ mit eigenen Farben:
+
+```json
+{"theme": "custom", "farben": {"hintergrund": "#05090d", "flaechen": "#0b141a", "text": "#d6eeee",
+ "akzent": "#00ffff", "kontrast": "#ff8a1f", "kritisch": "#ff3b30"}}
+```
+
+Fehlende Farben nehmen diese Vorgaben.
+
 ## Hinweis
 
 Kein offizielles Projekt der RWTH Aachen. Es nutzt dieselbe REST-Schnittstelle wie die Web-Oberfläche
